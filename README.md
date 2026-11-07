@@ -1,10 +1,10 @@
 # Switchboard
 
-Choose which cloud Claude Code talks to: Anthropic, Google Vertex AI, Amazon Bedrock, Azure AI Foundry, or your own gateway such as LiteLLM. Switchboard is a native Mac app plus a small command-line tool, `ccp`, that does the work.
+A Claude Code provider switcher for macOS. Choose which cloud Claude Code talks to: Anthropic (API key or subscription login), Google Vertex AI, Amazon Bedrock, Azure AI Foundry, or your own gateway such as LiteLLM. Switchboard is a native Mac app (SwiftUI) plus a small command-line tool, `ccp`, that does the work.
 
 - Keep several providers side by side and launch Claude Code with any of them.
 - Make one the default for plain `claude` in your terminal.
-- Keep keys in the macOS Keychain, not in files.
+- Keep API keys and tokens in the macOS Keychain, not in files.
 - See how much each provider has been used.
 
 ## Install
