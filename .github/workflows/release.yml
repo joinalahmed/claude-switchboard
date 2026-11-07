@@ -1,11 +1,21 @@
 name: release
 
-# Tag a version (git tag v1.0.0 && git push origin v1.0.0) to publish a release.
-# Run it by hand from the Actions tab to build the package without publishing.
+# Publish a release either by pushing a version tag (git tag v1.0.0 && git push origin v1.0.0), or by
+# running this workflow by hand from the Actions tab with a version and "publish" ticked.
+# Run by hand without "publish" to build the package and keep it as a workflow artifact only.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, for example 1.0.0"
+        required: false
+        default: ""
+      publish:
+        description: "Create the tag and GitHub release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,8 +30,11 @@ jobs:
 
       - name: Work out the version
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then V="${GITHUB_REF_NAME#v}"; else V="0.0.0-dev"; fi
+          if [ "$GITHUB_REF_TYPE" = tag ]; then V="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ inputs.version }}" ]; then V="${{ inputs.version }}"
+          else V="0.0.0-dev"; fi
           echo "VERSION=$V" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ] || [ "${{ inputs.publish }}" = "true" ]; then echo "PUBLISH=1" >> "$GITHUB_ENV"; fi
 
       - name: Build for Apple silicon and Intel
         run: |
@@ -73,7 +86,7 @@ jobs:
           path: dist/*
 
       - name: Publish the release
-        if: github.ref_type == 'tag'
+        if: env.PUBLISH == '1'
         run: |
           cat > notes.md <<'NOTES'
           ## Install
@@ -92,6 +105,8 @@ jobs:
 
           `ccp` alone (no app) is attached too, for Linux or a CLI-only setup. Check downloads against `SHA256SUMS.txt`.
           NOTES
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          TAG="v$VERSION"
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
             --title "Switchboard $VERSION" \
             --notes-file notes.md --generate-notes
