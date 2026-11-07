@@ -1,0 +1,56 @@
+#!/bin/bash
+# Switchboard bootstrap.
+# Builds the native app from Contents/Resources/src the first time it runs (and again whenever
+# the sources change), then starts it. Compiler output: ~/.claude-providers/.build/build.log
+
+APP="$(cd "$(dirname "$0")/../.." && pwd)"
+SRC="$APP/Contents/Resources/src"
+BIN="$APP/Contents/MacOS/Switchboard.bin"
+LOGDIR="$HOME/.claude-providers/.build"
+LOG="$LOGDIR/build.log"
+
+alert() {
+  osascript -e 'on run argv' \
+            -e 'tell current application to activate' \
+            -e 'display alert (item 1 of argv) message (item 2 of argv) as critical' \
+            -e 'end run' "$1" "$2" >/dev/null 2>&1
+}
+
+needs_build() {
+  [ -x "$BIN" ] || return 0
+  [ -n "$(find "$SRC" -name '*.swift' -newer "$BIN" 2>/dev/null | head -n 1)" ]
+}
+
+if needs_build; then
+  mkdir -p "$LOGDIR"
+  if ! xcrun --find swiftc >/dev/null 2>&1; then
+    alert "Swift isn't installed" "Switchboard builds itself with Apple's Swift compiler. Install Xcode, or run xcode-select --install in Terminal, then open this app again."
+    exit 1
+  fi
+  osascript -e 'display dialog "Building Switchboard. This takes about a minute and only happens when the app changes." buttons {"OK"} default button "OK" giving up after 300 with title "Switchboard" with icon note' >/dev/null 2>&1 &
+  DIALOG=$!
+  NEW="$BIN.new"
+  {
+    echo "== build $(date) =="
+    echo "sources: $(ls "$SRC"/*.swift | wc -l | tr -d ' ') files, arch $(uname -m)"
+    xcrun swiftc -O -swift-version 5 -parse-as-library \
+      -sdk "$(xcrun --show-sdk-path)" \
+      -target "$(uname -m)-apple-macos14.0" \
+      -o "$NEW" "$SRC"/*.swift
+  } >"$LOG" 2>&1
+  RC=$?
+  kill "$DIALOG" 2>/dev/null
+  if [ "$RC" -ne 0 ]; then
+    rm -f "$NEW"
+    echo "== build FAILED (exit $RC) ==" >>"$LOG"
+    if [ ! -x "$BIN" ]; then
+      alert "Switchboard couldn't be built" "The compiler output is saved in $LOG"
+      exit 1
+    fi
+  else
+    mv "$NEW" "$BIN"
+    echo "== build OK ==" >>"$LOG"
+  fi
+fi
+
+exec "$BIN" "$@"

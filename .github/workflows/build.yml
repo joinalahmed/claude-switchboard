@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile the app
+        run: |
+          swiftc -O -swift-version 5 -parse-as-library \
+            -sdk "$(xcrun --show-sdk-path)" \
+            -target "$(uname -m)-apple-macos14.0" \
+            -o /tmp/Switchboard app/Sources/*.swift
+      - name: Draw the app icon
+        run: |
+          app/make-icon.sh /tmp/AppIcon.icns
+          file /tmp/AppIcon.icns
+      - name: Check the shell scripts
+        run: |
+          bash -n bin/ccp
+          bash -n app/Switchboard
+          bash -n install.sh
+          sh -n app/make-icon.sh
+      - name: Smoke-test ccp
+        run: |
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          ./install.sh --no-app
+          export PATH="$HOME/bin:$PATH"
+          ccp templates --plain
+          ccp add demo -t anthropic-login --yes --default
+          ccp list
+          ccp show demo

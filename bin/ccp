@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# ccp — run Claude Code against a chosen provider, and manage providers.
+#
+# Run:
+#   ccp                          use the default provider
+#   ccp NAME [claude args]       e.g.  ccp vertex -c
+#
+# Manage providers (settings live in ~/.claude-providers):
+#   ccp list                     providers with descriptions (* = default)
+#   ccp templates                provider types you can add
+#   ccp add [NAME] [-t TYPE]     create a provider; asks for each value, secrets go to the Keychain
+#   ccp edit NAME                open NAME.env in your editor
+#   ccp key NAME [VAR]           (re)enter a secret stored in the Keychain
+#   ccp default NAME             set the default provider
+#   ccp remove NAME              delete a provider and its Keychain items
+#   ccp show [NAME]              print the resolved settings (secrets masked)
+#   ccp test [NAME]              make one real request through the provider
+#   ccp doctor                   look for things that override ccp
+#   ccp run [claude args]        always use the default provider (this is what the shell hook calls)
+#   ccp shell install|remove|status   make plain `claude` in your terminal follow the default provider
+#   ccp overrides [--fix]        find (and with --fix remove) provider variables in ~/.claude/settings*.json
+#
+# Every launch is recorded in ~/.claude-providers/usage/runs.log (when, which provider, which folder)
+# so Switchboard can attribute Claude Code's token usage to providers.
+#
+# Non-interactive add:  ccp add NAME -t TYPE --yes --set VAR=value ...   (--force replaces; --keep reuses stored secrets left blank)
+#   (secrets: export CCP_SECRET_VAR=value, so they stay off the command line)
+#
+# New provider types: drop TYPE.tpl into ~/.claude-providers/templates/. Header lines
+#   "# description:", "# var: NAME | prompt | default | required", "# secret: ..." define the
+#   questions; {{NAME}} marks where answers go; a leading "?" drops a line when its answer is blank.
+# A NAME.env may define ccp_check() for custom pre-launch checks (use warn / die).
+#
+# Provider precedence: first argument > $CLAUDE_PROVIDER > default file > vertex.
+# CCP_DRY_RUN=1 prints the resolved settings instead of launching claude.
+
+set -u
+CCP_VERSION=1
+
+DIR="${CLAUDE_PROVIDERS_DIR:-$HOME/.claude-providers}"
+TPL_DIR="$DIR/templates"
+ACCOUNT="${USER:-$(id -un)}"
+RESERVED=" help list ls templates template template-vars secrets add new edit remove rm key show test doctor default run shell overrides usage "
+SETS=""; REPL=""; EMPTYV=" "
+
+die()  { echo "ccp: $*" >&2; exit 1; }
+warn() { echo "ccp: warning: $*" >&2; }
+note() { echo "ccp: $*" >&2; }
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# ---- Keychain ---------------------------------------------------------------
+have_security() { command -v security >/dev/null 2>&1; }
+kc_has() { have_security && security find-generic-password -a "$ACCOUNT" -s "$1" >/dev/null 2>&1; }
+kc_set() { security add-generic-password -U -a "$ACCOUNT" -s "$1" -w "$2" >/dev/null 2>&1; }
+kc_del() { security delete-generic-password -a "$ACCOUNT" -s "$1" >/dev/null 2>&1; }
+
+# Used inside provider files:  export ANTHROPIC_AUTH_TOKEN="$(ccp_secret ccp-NAME-VAR)"
+ccp_secret() {
+  local v=""
+  if have_security; then v="$(security find-generic-password -a "$ACCOUNT" -s "$1" -w 2>/dev/null)"; fi
+  if [ -z "$v" ]; then warn "no Keychain item '$1' — fix with: ccp key ${provider:-NAME} ${1#ccp-${provider:-NAME}-}"; fi
+  printf '%s' "$v"
+}
+
+# ---- prompts ----------------------------------------------------------------
+is_tty() { [ -t 0 ] && [ -t 2 ]; }
+ask() {
+  local ans=""
+  if [ -n "${2:-}" ]; then read -r -p "$1 [$2]: " ans </dev/tty; else read -r -p "$1: " ans </dev/tty; fi
+  printf '%s' "${ans:-${2:-}}"
+}
+ask_secret() { local ans=""; read -r -s -p "$1: " ans </dev/tty; echo >&2; printf '%s' "$ans"; }
+confirm() { local a=""; read -r -p "$1 [y/N] " a </dev/tty; case "$a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac; }
+
+# ---- providers / templates --------------------------------------------------
+list_providers() {
+  local f
+  for f in "$DIR"/*.env; do
+    if [ -e "$f" ]; then basename "$f" .env; fi
+  done
+}
+list_templates() {
+  local f
+  for f in "$TPL_DIR"/*.tpl; do
+    if [ -e "$f" ]; then basename "$f" .tpl; fi
+  done
+}
+default_provider() {
+  if [ -n "${CLAUDE_PROVIDER:-}" ]; then echo "$CLAUDE_PROVIDER"
+  elif [ -f "$DIR/default" ]; then head -n1 "$DIR/default"
+  else echo vertex; fi
+}
+desc_of() { sed -n 's/^# description:[[:space:]]*//p' "$1" | head -n1; }
+needs_setup() { grep -v '^[[:space:]]*#' "$1" | grep -q 'CHANGE_ME'; }
+secret_services() { sed -n 's/^# secret-service:[[:space:]]*//p' "$1"; }
+valid_name() {
+  case "$1" in ''|*[!A-Za-z0-9_-]*|[-_]*) return 1 ;; esac
+  case "$RESERVED" in *" $1 "*) return 1 ;; esac
+  return 0
+}
+
+# "kind|VAR|prompt|default|required" for each question in a template
+tpl_specs() {
+  local line kind rest v p d r
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "# var:"*)    kind=var;    rest="${line#"# var:"}" ;;
+      "# secret:"*) kind=secret; rest="${line#"# secret:"}" ;;
+      *) continue ;;
+    esac
+    v=""; p=""; d=""; r=""
+    IFS='|' read -r v p d r <<EOF
+$rest
+EOF
+    printf '%s|%s|%s|%s|%s\n' "$kind" "$(trim "$v")" "$(trim "$p")" "$(trim "$d")" "$(trim "$r")"
+  done < "$1"
+}
+
+sets_get() {
+  local l
+  while IFS= read -r l; do
+    if [ -n "$l" ] && [ "${l%%=*}" = "$1" ]; then printf '%s' "${l#*=}"; return 0; fi
+  done <<EOF
+$SETS
+EOF
+  return 1
+}
+repl_of() {
+  local l
+  while IFS= read -r l; do
+    if [ -n "$l" ] && [ "${l%%=*}" = "$1" ]; then printf '%s' "${l#*=}"; return 0; fi
+  done <<EOF
+$REPL
+EOF
+  return 1
+}
+
+render_line() {
+  local line="$1" optional=0 out="" empty=0 pre rest var post rep
+  local open='{{' close='}}'
+  case "$line" in "?"*) optional=1; line="${line#\?}" ;; esac
+  while :; do
+    case "$line" in *"$open"*"$close"*) ;; *) break ;; esac
+    pre="${line%%"$open"*}"
+    rest="${line#*"$open"}"
+    var="${rest%%"$close"*}"
+    post="${rest#*"$close"}"
+    if rep="$(repl_of "$var")"; then :; else rep="''"; empty=1; warn "template placeholder {{$var}} has no matching '# var:' line"; fi
+    case "$EMPTYV" in *" $var "*) empty=1 ;; esac
+    out="$out$pre$rep"
+    line="$post"
+  done
+  out="$out$line"
+  if [ "$optional" = 1 ] && [ "$empty" = 1 ]; then return 0; fi
+  printf '%s\n' "$out"
+}
+
+# ---- commands ---------------------------------------------------------------
+cmd_templates() {
+  local t d plain=0
+  [ "${1:-}" = "--plain" ] && plain=1
+  [ -d "$TPL_DIR" ] || die "no templates folder at $TPL_DIR"
+  for t in $(list_templates); do
+    d="$(desc_of "$TPL_DIR/$t.tpl")"
+    if [ "$plain" = 1 ]; then printf '%s|%s\n' "$t" "$d"; else printf '  %-16s %s\n' "$t" "$d"; fi
+  done
+}
+
+cmd_list() {
+  local cur p f mark d st
+  cur="$(default_provider)"
+  if [ -z "$(list_providers)" ]; then echo "No providers yet. Add one with: ccp add"; return 0; fi
+  for p in $(list_providers); do
+    f="$DIR/$p.env"; mark=" "
+    if [ "$p" = "$cur" ]; then mark="*"; fi
+    d="$(desc_of "$f")"; st=""
+    if needs_setup "$f"; then st="   [needs setup: ccp edit $p]"; fi
+    printf '%s %-14s %s%s\n' "$mark" "$p" "$d" "$st"
+  done
+}
+
+cmd_add() {
+  local name="" tpl="" force=0 yes=0 mkdef=0 interactive=0 keep=0
+  SETS=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--template) [ $# -ge 2 ] || die "add: $1 needs a value"; tpl="$2"; shift 2 ;;
+      --set) [ $# -ge 2 ] || die "add: --set needs VAR=value"
+             case "$2" in *=*) SETS="$SETS$2"$'\n' ;; *) die "add: --set needs VAR=value" ;; esac; shift 2 ;;
+      -f|--force) force=1; shift ;;
+      -y|--yes) yes=1; shift ;;
+      --default) mkdef=1; shift ;;
+      --keep) keep=1; shift ;;
+      -*) die "add: unknown option $1" ;;
+      *) if [ -z "$name" ]; then name="$1"; else die "add: unexpected argument $1"; fi; shift ;;
+    esac
+  done
+  if [ "$yes" = 0 ] && is_tty; then interactive=1; fi
+  [ -d "$TPL_DIR" ] || die "no templates folder at $TPL_DIR"
+
+  if [ -z "$tpl" ]; then
+    [ "$interactive" = 1 ] || die "add: pass --template TYPE (see: ccp templates)"
+    local i=0 t names="" pick
+    echo "Provider types:" >&2
+    for t in $(list_templates); do
+      i=$((i+1)); names="$names $t"
+      printf '  %d) %-16s %s\n' "$i" "$t" "$(desc_of "$TPL_DIR/$t.tpl")" >&2
+    done
+    pick="$(ask 'Choose a type (number or name)' '')"
+    case "$pick" in
+      ''|*[!0-9]*) tpl="$pick" ;;
+      *) tpl="$(echo $names | cut -d' ' -f"$pick")" ;;
+    esac
+  fi
+  case "$tpl" in ''|*/*) die "add: unknown template '$tpl' (see: ccp templates)" ;; esac
+  local tplf="$TPL_DIR/$tpl.tpl"
+  [ -f "$tplf" ] || die "add: unknown template '$tpl' (see: ccp templates)"
+
+  if [ -z "$name" ]; then
+    [ "$interactive" = 1 ] || die "add: pass a NAME"
+    name="$(ask 'Name for this provider' "$tpl")"
+  fi
+  valid_name "$name" || die "add: invalid name '$name' (letters, digits, - and _; not a ccp command word)"
+  local out="$DIR/$name.env"
+  if [ -e "$out" ] && [ "$force" = 0 ]; then die "add: '$name' already exists (replace with --force, or: ccp edit $name)"; fi
+
+  REPL=""; EMPTYV=" "
+  local specs kind var prompt def req val repl svc envname kept secrets_header="" knownv=" "
+  specs="$(tpl_specs "$tplf")"
+  while IFS='|' read -r kind var prompt def req; do
+    [ -n "$var" ] || continue
+    knownv="$knownv$var "
+    val=""
+    if val="$(sets_get "$var")"; then :
+    elif [ "$kind" = secret ]; then
+      envname="CCP_SECRET_$var"; val="${!envname:-}"
+      if [ -z "$val" ] && [ "$interactive" = 1 ]; then val="$(ask_secret "$prompt")"; fi
+    elif [ "$interactive" = 1 ]; then val="$(ask "$prompt" "$def")"
+    else val="$def"; fi
+    kept=0
+    if [ "$kind" = secret ] && [ -z "$val" ] && [ "$keep" = 1 ] && kc_has "ccp-$name-$var"; then kept=1; fi
+    if [ -z "$val" ] && [ "$req" = required ] && [ "$kept" = 0 ]; then
+      if [ "$interactive" = 1 ]; then
+        while [ -z "$val" ]; do
+          if [ "$kind" = secret ]; then val="$(ask_secret "$prompt (required)")"; else val="$(ask "$prompt (required)" "$def")"; fi
+        done
+      else
+        die "add: $var is required (use --set $var=VALUE, or export CCP_SECRET_$var for secrets)"
+      fi
+    fi
+    if [ "$kept" = 1 ]; then
+      svc="ccp-$name-$var"
+      repl="\"\$(ccp_secret $svc)\""
+      secrets_header="$secrets_header# secret-service: $svc"$'\n'
+    elif [ "$kind" = secret ] && [ -n "$val" ]; then
+      svc="ccp-$name-$var"
+      if have_security && kc_set "$svc" "$val"; then
+        repl="\"\$(ccp_secret $svc)\""
+        secrets_header="$secrets_header# secret-service: $svc"$'\n'
+      else
+        warn "macOS Keychain unavailable; storing $var in $out (mode 600)"
+        repl="$(printf '%q' "$val")"
+      fi
+    else
+      repl="$(printf '%q' "$val")"
+    fi
+    if [ -z "$val" ] && [ "$kept" = 0 ]; then EMPTYV="$EMPTYV$var "; fi
+    REPL="$REPL$var=$repl"$'\n'
+  done <<EOF
+$specs
+EOF
+  local l k
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    k="${l%%=*}"
+    case "$knownv" in *" $k "*) ;; *) warn "ignoring --set $k (template '$tpl' has no such question)" ;; esac
+  done <<EOF
+$SETS
+EOF
+
+  umask 077
+  local tmp line
+  tmp="$(mktemp "$DIR/.add.XXXXXX")" || die "add: can't write in $DIR"
+  {
+    echo "# description: $(desc_of "$tplf")"
+    echo "# template: $tpl"
+    printf '%s' "$secrets_header"
+    echo
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in "# var:"*|"# secret:"*|"# description:"*) continue ;; esac
+      render_line "$line"
+    done < "$tplf"
+  } > "$tmp"
+  mv "$tmp" "$out" && chmod 600 "$out"
+  note "created $out"
+  if [ "$mkdef" = 0 ] && [ "$interactive" = 1 ] && confirm "Make '$name' the default provider?"; then mkdef=1; fi
+  if [ "$mkdef" = 1 ]; then echo "$name" > "$DIR/default"; note "default provider is now $name"; fi
+  return 0
+}
+
+cmd_edit() {
+  local n="${1:-}" f ed
+  [ -n "$n" ] || die "usage: ccp edit NAME"
+  f="$DIR/$n.env"; [ -f "$f" ] || die "no provider '$n'"
+  ed="${VISUAL:-${EDITOR:-}}"
+  if [ -n "$ed" ]; then exec $ed "$f"
+  elif command -v open >/dev/null 2>&1; then exec open -t "$f"
+  else exec vi "$f"; fi
+}
+
+cmd_remove() {
+  local n="" yes=0 a f svc services
+  for a in "$@"; do case "$a" in -y|--yes) yes=1 ;; *) n="$a" ;; esac; done
+  [ -n "$n" ] || die "usage: ccp remove NAME [--yes]"
+  f="$DIR/$n.env"; [ -f "$f" ] || die "no provider '$n'"
+  services="$(secret_services "$f")"
+  if [ "$yes" = 0 ]; then
+    is_tty || die "remove: pass --yes to confirm"
+    confirm "Delete provider '$n'${services:+ and its Keychain items}?" || { note "cancelled"; return 0; }
+  fi
+  if [ -n "$services" ]; then
+    while IFS= read -r svc; do
+      [ -n "$svc" ] || continue
+      if have_security; then kc_del "$svc"; fi
+    done <<EOF
+$services
+EOF
+  fi
+  rm -f "$f"
+  if [ -f "$DIR/default" ] && [ "$(head -n1 "$DIR/default")" = "$n" ]; then rm -f "$DIR/default"; note "removed default setting (falls back to vertex)"; fi
+  note "removed $n"
+}
+
+cmd_key() {
+  local n="${1:-}" only="${2:-}" f svc var val envname did=0 services
+  [ -n "$n" ] || die "usage: ccp key NAME [VAR]"
+  f="$DIR/$n.env"; [ -f "$f" ] || die "no provider '$n'"
+  have_security || die "key: the macOS Keychain ('security') isn't available here"
+  local ttyok=0
+  if is_tty; then ttyok=1; fi
+  services="$(secret_services "$f")"
+  [ -n "$services" ] || die "$n keeps no secrets in the Keychain (edit it with: ccp edit $n, or recreate: ccp add $n --force)"
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    var="${svc#ccp-$n-}"
+    if [ -n "$only" ] && [ "$only" != "$var" ]; then continue; fi
+    envname="CCP_SECRET_$var"; val="${!envname:-}"
+    if [ -z "$val" ]; then
+      [ "$ttyok" = 1 ] || die "key: no terminal; export CCP_SECRET_$var=VALUE"
+      val="$(ask_secret "New value for $var ($n)")"
+    fi
+    if [ -z "$val" ]; then note "skipped $var (empty)"; continue; fi
+    kc_set "$svc" "$val" || die "couldn't update Keychain item $svc"
+    note "updated $var for $n"; did=1
+  done <<EOF
+$services
+EOF
+  if [ "$did" = 0 ]; then
+    if [ -n "$only" ]; then die "key: $only is not a stored secret of $n"; fi
+    die "key: nothing updated"
+  fi
+  return 0
+}
+
+cmd_default() {
+  local n="${1:-}"
+  [ -n "$n" ] || die "usage: ccp default NAME"
+  [ -f "$DIR/$n.env" ] || die "no provider '$n' (see: ccp list)"
+  echo "$n" > "$DIR/default"
+  echo "default provider is now $n"
+}
+
+# ---- loading a provider's environment ---------------------------------------
+managed_vars() {
+  {
+    printf '%s\n' ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL ANTHROPIC_DEFAULT_MODEL \
+      ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION ANTHROPIC_DEFAULT_OPUS_MODEL \
+      ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_CUSTOM_HEADERS \
+      ANTHROPIC_VERTEX_PROJECT_ID ANTHROPIC_VERTEX_BASE_URL ANTHROPIC_BEDROCK_BASE_URL \
+      ANTHROPIC_BEDROCK_MANTLE_BASE_URL ANTHROPIC_BEDROCK_REGION_PREFIX ANTHROPIC_FOUNDRY_RESOURCE \
+      ANTHROPIC_FOUNDRY_BASE_URL ANTHROPIC_FOUNDRY_API_KEY ANTHROPIC_FOUNDRY_AUTH_TOKEN \
+      CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_FOUNDRY \
+      CLAUDE_CODE_SKIP_VERTEX_AUTH CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_MANTLE_AUTH \
+      CLAUDE_CODE_SKIP_FOUNDRY_AUTH CLOUD_ML_REGION AWS_BEARER_TOKEN_BEDROCK AWS_PROFILE AWS_REGION
+    env | sed -n 's/^\(VERTEX_REGION_CLAUDE_[A-Za-z0-9_]*\)=.*/\1/p'
+    cat "$DIR"/*.env 2>/dev/null | sed -n 's/^[[:space:]]*export[[:space:]][[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'
+  } | grep -Ev '^(PATH|HOME|USER|LOGNAME|SHELL|TERM|PWD|OLDPWD|TMPDIR|LANG|LC_[A-Z_]+|SHLVL|_|CLAUDE_PROVIDERS_DIR|CLAUDE_PROVIDER|CCP_[A-Z_]+)$' | sort -u
+}
+
+load_provider() {
+  provider="$1"
+  file="$DIR/$provider.env"
+  [ -f "$file" ] || die "unknown provider '$provider' (have: $(list_providers | tr '\n' ' '); create one with: ccp add)"
+  local v p adc s
+  # Clean slate: anything any provider (or Claude Code) uses is cleared first, so nothing leaks between providers.
+  for v in $(managed_vars); do unset "$v"; done
+  unset -f ccp_check 2>/dev/null
+  if needs_setup "$file"; then die "$file still has CHANGE_ME placeholders — edit it first (ccp edit $provider)"; fi
+  set -a
+  # shellcheck disable=SC1090
+  . "$file" || { set +a; die "couldn't load $file"; }
+  set +a
+
+  if [ "${CLAUDE_CODE_USE_VERTEX:-}" = 1 ]; then
+    if [ -z "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ] && command -v gcloud >/dev/null 2>&1; then
+      p="$(gcloud config get-value project 2>/dev/null || true)"
+      if [ -n "$p" ]; then export ANTHROPIC_VERTEX_PROJECT_ID="$p"; fi
+    fi
+    [ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ] || die "no GCP project: set ANTHROPIC_VERTEX_PROJECT_ID in $file or run: gcloud config set project PROJECT_ID"
+    [ -n "${CLOUD_ML_REGION:-}" ] || die "CLOUD_ML_REGION is empty in $file"
+    adc="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/.config/gcloud/application_default_credentials.json}"
+    if [ ! -f "$adc" ]; then warn "no Google credentials at $adc — run: gcloud auth application-default login"; fi
+  fi
+  if [ -n "${ANTHROPIC_BASE_URL:-}" ] && command -v curl >/dev/null 2>&1; then
+    if ! curl -s -o /dev/null --max-time 2 "${ANTHROPIC_BASE_URL%/}/health/liveliness"; then
+      warn "$ANTHROPIC_BASE_URL isn't answering — is the server running?"
+    fi
+  fi
+  if declare -F ccp_check >/dev/null 2>&1; then ccp_check; fi
+
+  for s in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json" \
+           "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+    if [ -f "$s" ] && grep -qE '"(ANTHROPIC_[A-Z_]+|CLAUDE_CODE_USE_[A-Z]+|CLOUD_ML_REGION|AWS_PROFILE|AWS_REGION)"' "$s"; then
+      warn "$s sets provider variables that override ccp — remove them from its \"env\" block (see: ccp doctor)"
+    fi
+  done
+
+  SUMMARY="$provider"
+  if [ -n "${CLAUDE_CODE_USE_VERTEX:-}" ]; then SUMMARY="$SUMMARY (vertex: project ${ANTHROPIC_VERTEX_PROJECT_ID:-?}, region ${CLOUD_ML_REGION:-?})"; fi
+  if [ -n "${CLAUDE_CODE_USE_BEDROCK:-}" ]; then SUMMARY="$SUMMARY (bedrock${AWS_REGION:+: region $AWS_REGION}${AWS_PROFILE:+, profile $AWS_PROFILE})"; fi
+  if [ -n "${CLAUDE_CODE_USE_FOUNDRY:-}" ]; then SUMMARY="$SUMMARY (foundry: ${ANTHROPIC_FOUNDRY_RESOURCE:-${ANTHROPIC_FOUNDRY_BASE_URL:-?}})"; fi
+  if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then SUMMARY="$SUMMARY (gateway: $ANTHROPIC_BASE_URL)"; fi
+  if [ -n "${ANTHROPIC_MODEL:-}" ]; then SUMMARY="$SUMMARY model=$ANTHROPIC_MODEL"; fi
+}
+
+show_env() {
+  local v
+  for v in $(managed_vars); do
+    if [ -n "${!v+x}" ]; then printf '%s=%s\n' "$v" "${!v}"; fi
+  done | sed -E 's/^([A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)=.*/\1=***/'
+}
+
+cmd_show() { load_provider "${1:-$(default_provider)}"; echo "ccp: $SUMMARY"; show_env; }
+
+cmd_test() {
+  local n="${1:-$(default_provider)}" out rc
+  load_provider "$n"
+  command -v claude >/dev/null 2>&1 || die "'claude' not found on PATH"
+  note "testing $SUMMARY ..."
+  run_start "$n"
+  if command -v perl >/dev/null 2>&1; then
+    out="$(perl -e 'alarm 120; exec @ARGV' claude -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
+  else
+    out="$(claude -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
+  fi
+  run_end "$rc"
+  if [ "$rc" = 0 ] && [ -n "$out" ]; then
+    echo "OK  $n works. Reply: $(printf '%s' "$out" | head -n1)"
+    return 0
+  fi
+  echo "FAIL  $n (exit $rc):"
+  printf '%s\n' "$out" | tail -n 15
+  return 1
+}
+
+
+# ---- usage log ----------------------------------------------------------------
+RUNLOG="$DIR/usage/runs.log"
+RUN_OPEN=0
+run_start() {
+  mkdir -p "$DIR/usage" 2>/dev/null && chmod 700 "$DIR/usage" 2>/dev/null
+  printf 'S\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$$" "$1" "$(pwd -P | tr '\t\n' '  ')" >>"$RUNLOG" 2>/dev/null
+  RUN_OPEN=1
+}
+run_end() {
+  [ "$RUN_OPEN" = 1 ] || return 0
+  RUN_OPEN=0
+  printf 'E\t%s\t%s\t%s\n' "$(date +%s)" "$$" "${1:-0}" >>"$RUNLOG" 2>/dev/null
+}
+
+# ---- plain `claude` follows the default provider ----------------------------------
+RC_BEGIN='# >>> ccp (Claude provider switcher) >>>'
+RC_END='# <<< ccp <<<'
+rc_files() {
+  if [ -n "${CCP_RC_FILE:-}" ]; then echo "$CCP_RC_FILE"; return; fi
+  case "${SHELL:-}" in
+    */bash) echo "$HOME/.bash_profile"; if [ -f "$HOME/.bashrc" ]; then echo "$HOME/.bashrc"; fi ;;
+    *) echo "$HOME/.zshrc" ;;
+  esac
+}
+self_path() {
+  local d
+  d="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || d=""
+  if [ -n "$d" ] && [ -x "$d/$(basename "$0")" ]; then echo "$d/$(basename "$0")"; else command -v ccp; fi
+}
+hook_in() { [ -f "$1" ] && grep -qxF "$RC_BEGIN" "$1"; }
+hook_strip() {
+  awk -v b="$RC_BEGIN" -v e="$RC_END" '$0==b{skip=1;next} $0==e{skip=0;next} !skip{print}' "$1" |
+    awk '/^[[:space:]]*$/{n++; next} {while(n>0){print ""; n--} print}'
+}
+cmd_shell() {
+  local act="${1:-status}" f me tmp any=1
+  case "$act" in
+    status)
+      for f in $(rc_files); do
+        if hook_in "$f"; then printf 'installed\t%s\n' "$f"; any=0; else printf 'missing\t%s\n' "$f"; fi
+      done
+      return $any ;;
+    install)
+      me="$(self_path)"; [ -n "$me" ] || die "can't work out where ccp lives"
+      for f in $(rc_files); do
+        if [ -f "$f" ] && [ ! -e "$f.ccp-backup" ]; then cp -p "$f" "$f.ccp-backup"; fi
+        tmp="$(mktemp "${TMPDIR:-/tmp}/ccp-rc.XXXXXX")" || die "no temp file"
+        if [ -f "$f" ]; then hook_strip "$f" > "$tmp"; fi
+        {
+          [ -s "$tmp" ] && echo
+          echo "$RC_BEGIN"
+          echo '# Plain `claude` uses the provider chosen in Switchboard (or: ccp default NAME).'
+          echo '# One-off: CLAUDE_PROVIDER=NAME claude   |   skip ccp: command claude'
+          printf 'claude() {\n  if [ -x %q ]; then %q run "$@"; else command claude "$@"; fi\n}\n' "$me" "$me"
+          echo "$RC_END"
+        } >> "$tmp"
+        cat "$tmp" > "$f" || { rm -f "$tmp"; die "couldn't write $f"; }
+        rm -f "$tmp"
+        printf 'installed\t%s\n' "$f"
+      done
+      return 0 ;;
+    remove)
+      for f in $(rc_files); do
+        if hook_in "$f"; then
+          tmp="$(mktemp "${TMPDIR:-/tmp}/ccp-rc.XXXXXX")" || die "no temp file"
+          hook_strip "$f" > "$tmp"
+          cat "$tmp" > "$f" || { rm -f "$tmp"; die "couldn't write $f"; }
+          rm -f "$tmp"
+          printf 'removed\t%s\n' "$f"
+        else
+          printf 'missing\t%s\n' "$f"
+        fi
+      done
+      return 0 ;;
+    *) die "usage: ccp shell install|remove|status" ;;
+  esac
+}
+
+# ---- provider variables hiding in Claude Code's own settings ------------------------
+cmd_overrides() {
+  local fix=0 f keys
+  if [ "${1:-}" = "--fix" ]; then fix=1; fi
+  command -v perl >/dev/null 2>&1 || die "perl is needed for this"
+  keys="$(managed_vars)"
+  for f in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; do
+    [ -f "$f" ] || continue
+    printf '%s\n' "$keys" | CCP_FILE="$f" CCP_FIX="$fix" perl -MJSON::PP -MPOSIX -e '
+      my $file = $ENV{CCP_FILE}; my $fix = $ENV{CCP_FIX};
+      my %k; while (my $l = <STDIN>) { chomp $l; $k{$l} = 1 if length $l; }
+      open(my $fh, "<:raw", $file) or die "ccp: cannot read $file: $!\n";
+      my $txt = do { local $/; <$fh> }; close $fh;
+      my $json = JSON::PP->new->utf8->canonical->pretty->indent_length(2);
+      my $d = eval { $json->decode($txt) };
+      if (!$d || ref $d ne "HASH") { print STDERR "ccp: $file is not plain JSON, skipped\n"; exit 0; }
+      my $env = $d->{env};
+      exit 0 unless ref $env eq "HASH";
+      my @hit = sort grep { $k{$_} } keys %$env;
+      exit 0 unless @hit;
+      if (!$fix) { print "$file\t$_\n" for @hit; exit 0; }
+      my $backup = "$file.ccp-backup-" . POSIX::strftime("%Y%m%d%H%M%S", localtime);
+      open(my $o, ">:raw", $backup) or die "ccp: cannot write backup $backup: $!\n";
+      print $o $txt; close $o; chmod 0600, $backup;
+      delete $env->{$_} for @hit;
+      delete $d->{env} unless %$env;
+      open(my $w, ">:raw", $file) or die "ccp: cannot write $file: $!\n";
+      print $w $json->encode($d); close $w;
+      print "backup\t$backup\n";
+      print "removed\t$file\t$_\n" for @hit;
+    ' || return 1
+  done
+  return 0
+}
+
+# ---- doctor -----------------------------------------------------------------
+d_ok()   { echo "  [ok]   $*"; }
+d_warn() { echo "  [warn] $*"; }
+d_bad()  { echo "  [FAIL] $*"; D_BAD=$((D_BAD+1)); }
+
+cmd_doctor() {
+  D_BAD=0
+  local c p f perm svc s hits cur
+  echo "claude"
+  if c="$(command -v claude)"; then d_ok "$c ($(claude --version 2>/dev/null | head -n1))"; else d_bad "'claude' not found on PATH"; fi
+  if command -v ccp >/dev/null 2>&1; then d_ok "ccp is on PATH ($(command -v ccp))"; else d_warn "ccp isn't on PATH — add to ~/.zshrc:  export PATH=\"\$HOME/bin:\$PATH\""; fi
+
+  if hook_in "$(rc_files | head -n1)"; then d_ok "plain 'claude' follows your default provider (shell hook installed)"
+  else d_warn "plain 'claude' ignores ccp — turn on the shell hook:  ccp shell install"; fi
+
+  echo "providers ($DIR)"
+  cur="$(default_provider)"
+  if [ -z "$(list_providers)" ]; then d_warn "none yet — run: ccp add"; fi
+  for p in $(list_providers); do
+    f="$DIR/$p.env"
+    if [ "$p" = "$cur" ]; then d_ok "$p (default)"; else d_ok "$p"; fi
+    if needs_setup "$f"; then d_warn "$p still has CHANGE_ME placeholders (ccp edit $p)"; fi
+    perm="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
+    case "$perm" in *00) ;; *) d_warn "$p.env is readable by others (mode $perm) — chmod 600 $f" ;; esac
+    if grep -E '^[[:space:]]*export[[:space:]]+[A-Za-z0-9_]*(KEY|TOKEN|SECRET)[A-Za-z0-9_]*=' "$f" | grep -v ccp_secret | grep -v CHANGE_ME | grep -vqE "=(''|\"\"|)[[:space:]]*(#.*)?$"; then
+      d_warn "$p.env holds a plaintext secret — move it to the Keychain: ccp add $p --force"
+    fi
+    while IFS= read -r svc; do
+      [ -n "$svc" ] || continue
+      if kc_has "$svc"; then d_ok "$p: Keychain item ${svc#ccp-$p-} present"; else d_bad "$p: Keychain item ${svc#ccp-$p-} missing — ccp key $p"; fi
+    done <<EOF
+$(secret_services "$f")
+EOF
+  done
+  if [ -n "$cur" ] && [ ! -f "$DIR/$cur.env" ]; then d_bad "default provider '$cur' doesn't exist (ccp default NAME)"; fi
+
+  echo "things that could override ccp"
+  hits=0
+  for s in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    if [ -f "$s" ]; then
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        d_warn "$s:$p — ccp clears it for sessions it starts, but a plain 'claude' still gets it"; hits=1
+      done <<EOF
+$(grep -nE '^[[:space:]]*export[[:space:]]+(ANTHROPIC_|CLAUDE_CODE_USE_|CLOUD_ML_REGION)' "$s" | sed 's/=.*//')
+EOF
+    fi
+  done
+  for s in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json" "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+    if [ -f "$s" ] && grep -qE '"(ANTHROPIC_[A-Z_]+|CLAUDE_CODE_USE_[A-Z]+|CLOUD_ML_REGION|AWS_PROFILE|AWS_REGION)"' "$s"; then
+      d_bad "$s sets provider variables in its \"env\" block; Claude Code applies them over ccp. Remove those keys."; hits=1
+    fi
+  done
+  if [ "$hits" = 0 ]; then d_ok "no overrides found in shell profiles or Claude settings"; fi
+  [ "$D_BAD" = 0 ]
+}
+
+# ---- dispatch ---------------------------------------------------------------
+sub="${1:-}"
+case "$sub" in
+  --version) echo "ccp $CCP_VERSION"; exit 0 ;;
+  help|-h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -l|--list)
+    cur="$(default_provider)"
+    for p in $(list_providers); do
+      if [ "$p" = "$cur" ]; then echo "* $p (default)"; else echo "  $p"; fi
+    done
+    exit 0 ;;
+  list|ls) cmd_list; exit $? ;;
+  templates|template) cmd_templates "${2:-}"; exit $? ;;
+  template-vars)
+    [ -f "$TPL_DIR/${2:-}.tpl" ] || die "unknown template '${2:-}'"
+    tpl_specs "$TPL_DIR/$2.tpl"; exit 0 ;;
+  secrets)
+    [ -f "$DIR/${2:-}.env" ] || die "no provider '${2:-}'"
+    secret_services "$DIR/$2.env" | while IFS= read -r svc; do [ -n "$svc" ] && echo "${svc#ccp-$2-}"; done
+    exit 0 ;;
+  add|new) shift; cmd_add "$@"; exit $? ;;
+  edit) shift; cmd_edit "$@"; exit $? ;;
+  remove|rm) shift; cmd_remove "$@"; exit $? ;;
+  key) shift; cmd_key "$@"; exit $? ;;
+  show) cmd_show "${2:-}"; exit $? ;;
+  test) cmd_test "${2:-}"; exit $? ;;
+  doctor) cmd_doctor; exit $? ;;
+  shell) shift; cmd_shell "$@"; exit $? ;;
+  overrides) shift; cmd_overrides "$@"; exit $? ;;
+  default|--default) shift; cmd_default "$@"; exit $? ;;
+esac
+
+provider=""
+if [ "$sub" = run ]; then
+  shift
+elif [ -n "${1:-}" ] && [ -f "$DIR/$1.env" ]; then
+  provider="$1"; shift
+fi
+[ -n "$provider" ] || provider="$(default_provider)"
+load_provider "$provider"
+
+if [ -n "${CCP_DRY_RUN:-}" ]; then echo "ccp: $SUMMARY"; show_env; exit 0; fi
+command -v claude >/dev/null 2>&1 || die "'claude' not found on PATH"
+echo "ccp: claude -> $SUMMARY" >&2
+run_start "$provider"
+trap ':' INT
+trap 'run_end 129; exit 129' HUP
+trap 'run_end 143; exit 143' TERM
+claude "$@"
+rc=$?
+run_end "$rc"
+exit "$rc"

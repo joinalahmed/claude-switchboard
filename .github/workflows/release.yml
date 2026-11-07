@@ -1,0 +1,97 @@
+name: release
+
+# Tag a version (git tag v1.0.0 && git push origin v1.0.0) to publish a release.
+# Run it by hand from the Actions tab to build the package without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then V="${GITHUB_REF_NAME#v}"; else V="0.0.0-dev"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Build for Apple silicon and Intel
+        run: |
+          mkdir -p build
+          for arch in arm64 x86_64; do
+            swiftc -O -swift-version 5 -parse-as-library \
+              -sdk "$(xcrun --show-sdk-path)" \
+              -target "$arch-apple-macos14.0" \
+              -o "build/Switchboard-$arch" app/Sources/*.swift
+          done
+          lipo -create -output build/Switchboard build/Switchboard-arm64 build/Switchboard-x86_64
+          lipo -info build/Switchboard
+
+      - name: Assemble Switchboard.app
+        run: |
+          APP=build/Switchboard.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin" "$APP/Contents/Resources/templates"
+          cp build/Switchboard "$APP/Contents/MacOS/Switchboard"
+          cp app/Info.plist "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$APP/Contents/Info.plist"
+          app/make-icon.sh "$APP/Contents/Resources/AppIcon.icns"
+          cp bin/ccp "$APP/Contents/Resources/bin/ccp"
+          cp templates/*.tpl "$APP/Contents/Resources/templates/"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Check that the app starts and installs ccp
+        run: |
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          build/Switchboard.app/Contents/MacOS/Switchboard &
+          pid=$!
+          sleep 8
+          kill -0 "$pid"
+          test -x "$HOME/bin/ccp"
+          ls "$HOME/.claude-providers/templates"
+          kill "$pid"
+
+      - name: Package
+        run: |
+          mkdir dist
+          ditto -c -k --keepParent build/Switchboard.app "dist/Switchboard-$VERSION-macos.zip"
+          cp bin/ccp dist/ccp
+          (cd dist && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: switchboard-${{ env.VERSION }}
+          path: dist/*
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Install
+
+          1. Unzip `Switchboard-*-macos.zip` and move **Switchboard.app** to your Applications folder.
+          2. The app isn't notarized, so macOS blocks the first launch. Clear the block once:
+
+             ```sh
+             xattr -dr com.apple.quarantine /Applications/Switchboard.app
+             ```
+
+             Or open **System Settings > Privacy & Security** and choose **Open Anyway**.
+          3. Open it. On first launch it installs the `ccp` command to `~/bin` and the provider templates to `~/.claude-providers`.
+
+          Needs macOS 14 or later and Claude Code. Runs natively on Apple silicon and Intel.
+
+          `ccp` alone (no app) is attached too, for Linux or a CLI-only setup. Check downloads against `SHA256SUMS.txt`.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Switchboard $VERSION" \
+            --notes-file notes.md --generate-notes
