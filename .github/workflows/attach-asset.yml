@@ -1,0 +1,39 @@
+name: attach-asset
+
+# Attaches one file to an existing release, so images can live with the release instead of in git.
+# Run it from the Actions tab with the release tag, a .jpg/.png file name and the file's base64.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0"
+        required: true
+      name:
+        description: "File name, for example provider.jpg"
+        required: true
+      data:
+        description: "File contents, base64 encoded"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Attach the file
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          NAME: ${{ inputs.name }}
+          DATA: ${{ inputs.data }}
+        run: |
+          case "$NAME" in
+            *[!A-Za-z0-9._-]*|"") echo "bad file name"; exit 1 ;;
+            *.jpg|*.png) ;;
+            *) echo "only .jpg and .png"; exit 1 ;;
+          esac
+          printf '%s' "$DATA" | base64 -d > "$NAME"
+          file "$NAME"
+          gh release upload "$TAG" "$NAME" --clobber --repo "$GITHUB_REPOSITORY"
