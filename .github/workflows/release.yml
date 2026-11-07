@@ -51,13 +51,13 @@ jobs:
 
       - name: Check that the app starts and installs ccp
         run: |
-          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
           build/Switchboard.app/Contents/MacOS/Switchboard &
           pid=$!
           sleep 8
           kill -0 "$pid"
           test -x "$HOME/bin/ccp"
           ls "$HOME/.claude-providers/templates"
+          "$HOME/bin/ccp" --version
           kill "$pid"
 
       - name: Package
