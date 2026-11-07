@@ -28,13 +28,21 @@ struct AddProviderSheet: View {
 
     private var pickerView: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("New provider")
-                    .font(.title2.weight(.semibold))
-                Text("Where should Claude Code send its requests?")
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 14) {
+                GradientTile(symbol: "plus", accent: Palette.brand, size: 44)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("New provider")
+                        .font(.system(size: 24, weight: .bold, design: .rounded))
+                    Text("Where should Claude Code send its requests?")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
             }
             .padding(20)
+            .background(
+                LinearGradient(colors: [Palette.brand.a.opacity(0.16), Palette.brand.b.opacity(0.06)],
+                               startPoint: .leading, endPoint: .trailing)
+            )
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 12)], spacing: 12) {
                     ForEach(store.templates) { t in
@@ -133,19 +141,19 @@ struct AddProviderSheet: View {
 
     private func formView(_ t: Template) -> some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Image(systemName: t.symbol)
-                    .font(.system(size: 22))
-                    .foregroundStyle(.tint)
-                    .frame(width: 40, height: 40)
-                    .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 9))
+            HStack(spacing: 14) {
+                GradientTile(symbol: t.symbol, accent: t.accent, size: 46)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(t.name).font(.title3.weight(.semibold))
+                    Text(t.name).font(.system(size: 22, weight: .bold, design: .rounded))
                     Text(t.summary).foregroundStyle(.secondary).font(.callout)
                 }
                 Spacer()
             }
             .padding(20)
+            .background(
+                LinearGradient(colors: [t.accent.a.opacity(0.18), t.accent.b.opacity(0.06)],
+                               startPoint: .leading, endPoint: .trailing)
+            )
 
             Form {
                 Section {
@@ -187,6 +195,8 @@ struct AddProviderSheet: View {
                 }
             }
             .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .tint(t.accent.a)
 
             Divider()
             HStack {
@@ -204,7 +214,7 @@ struct AddProviderSheet: View {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("Create provider") { create(t) }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(GradientButtonStyle(accent: t.accent))
                     .keyboardShortcut(.defaultAction)
                     .disabled(!canCreate(t))
             }
@@ -216,13 +226,13 @@ struct AddProviderSheet: View {
 @MainActor
 struct TemplateCard: View {
     let template: Template
+    @State private var hovering = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: template.symbol)
-                .font(.system(size: 20))
-                .foregroundStyle(.tint)
-                .frame(width: 32, height: 32)
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        let accent = template.accent
+        return HStack(alignment: .top, spacing: 12) {
+            GradientTile(symbol: template.symbol, accent: accent, size: 38)
             VStack(alignment: .leading, spacing: 3) {
                 Text(template.name)
                     .font(.headline)
@@ -236,9 +246,19 @@ struct TemplateCard: View {
             Spacer(minLength: 0)
         }
         .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 78, alignment: .topLeading)
-        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: .infinity, minHeight: 84, alignment: .topLeading)
+        .background(
+            ZStack {
+                shape.fill(Color(nsColor: .controlBackgroundColor))
+                shape.fill(LinearGradient(colors: [accent.a.opacity(hovering ? 0.2 : 0.09), accent.b.opacity(hovering ? 0.08 : 0.02)],
+                                          startPoint: .topLeading, endPoint: .bottomTrailing))
+            }
+        )
+        .overlay(shape.strokeBorder(accent.a.opacity(hovering ? 0.7 : 0.25), lineWidth: hovering ? 1.5 : 1))
+        .contentShape(shape)
+        .hoverLift(accent.a)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.15), value: hovering)
         .accessibilityElement(children: .combine)
     }
 }

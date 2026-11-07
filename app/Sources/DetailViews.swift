@@ -8,7 +8,7 @@ struct ProviderDetailView: View {
 
     var body: some View {
         Form {
-            HeaderSection(provider: provider)
+            HeroSection(provider: provider)
             LaunchSection(provider: provider)
             ConnectionSection(provider: provider)
             UsageSection(provider: provider)
@@ -17,82 +17,113 @@ struct ProviderDetailView: View {
             ManageSection(provider: provider)
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+        .background(Backdrop(accent: provider.accent))
+        .tint(provider.accent.a)
         .navigationTitle(provider.name)
         .navigationSubtitle(provider.summary)
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    Task { await store.test(provider.name) }
-                } label: {
-                    Label("Test", systemImage: "bolt.horizontal")
-                }
-                .help("Send one real request through \(provider.name)")
-                .disabled(store.testing.contains(provider.name))
-
-                Button {
-                    store.launch(provider.name)
-                } label: {
-                    Label("Launch", systemImage: "play.fill")
-                }
-                .help("Open Claude Code in Terminal with \(provider.name)")
-            }
-        }
     }
 }
 
-// MARK: - Header
+// MARK: - Hero
 
 @MainActor
-struct HeaderSection: View {
+struct HeroSection: View {
     @EnvironmentObject var store: Store
     let provider: Provider
+
+    private var accent: Accent { provider.accent }
 
     private var symbol: String {
         let t = store.templates.first(where: { $0.name == provider.templateName })
         return t?.symbol ?? "terminal"
     }
 
+    private var testing: Bool { store.testing.contains(provider.name) }
+
     var body: some View {
-        Section {
-            HStack(alignment: .top, spacing: 14) {
-                Image(systemName: symbol)
-                    .font(.system(size: 26, weight: .regular))
-                    .foregroundStyle(.tint)
-                    .frame(width: 44, height: 44)
-                    .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(provider.name)
-                        .font(.title2.weight(.semibold))
-                    Text(provider.summary)
-                        .foregroundStyle(.secondary)
-                    HStack(spacing: 12) {
-                        Label(provider.status.label, systemImage: provider.status.symbol)
-                            .foregroundStyle(provider.status.color)
-                        if provider.isDefault {
-                            Label("Default", systemImage: "star.fill")
-                                .foregroundStyle(.yellow)
-                        }
-                    }
-                    .font(.callout)
-                    statusHint
-                }
-                Spacer(minLength: 0)
+        let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+        return Section {
+            ZStack {
+                shape.fill(accent.gradient)
+                CableDecoration()
+                shape.fill(LinearGradient(colors: [Color.clear, Color.black.opacity(0.2)],
+                                          startPoint: .top, endPoint: .bottom))
+                content
             }
-            .padding(.vertical, 4)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
+            .shadow(color: accent.a.opacity(0.35), radius: 18, y: 9)
+            .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 8, trailing: 0))
+            .listRowBackground(Color.clear)
         }
     }
 
+    private var content: some View {
+        HStack(alignment: .center, spacing: 18) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.white.opacity(0.22))
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.45), lineWidth: 1)
+                Image(systemName: symbol)
+                    .font(.system(size: 36, weight: .semibold))
+                    .foregroundStyle(Color.white)
+                    .shadow(color: Color.black.opacity(0.2), radius: 2, y: 1)
+            }
+            .frame(width: 78, height: 78)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text(provider.name)
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.white)
+                    .lineLimit(1)
+                Text(provider.summary)
+                    .foregroundStyle(Color.white.opacity(0.9))
+                    .lineLimit(2)
+                HStack(spacing: 8) {
+                    HeroChip(text: provider.status.label, symbol: provider.status.symbol)
+                    if provider.isDefault {
+                        HeroChip(text: "Default for claude", symbol: "star.fill")
+                    }
+                }
+                hint
+            }
+            Spacer(minLength: 8)
+            VStack(spacing: 9) {
+                Button {
+                    store.launch(provider.name)
+                } label: {
+                    Label("Launch", systemImage: "play.fill")
+                }
+                .buttonStyle(HeroButtonStyle(filled: true, tint: accent.b))
+                .disabled(provider.needsSetup)
+                .help("Open Claude Code in Terminal with \(provider.name)")
+
+                Button {
+                    Task { await store.test(provider.name) }
+                } label: {
+                    Label(testing ? "Testing…" : "Test", systemImage: "bolt.horizontal.fill")
+                }
+                .buttonStyle(HeroButtonStyle(filled: false, tint: accent.b))
+                .disabled(testing || provider.needsSetup)
+                .help("Send one real request through \(provider.name)")
+            }
+        }
+        .padding(22)
+    }
+
     @ViewBuilder
-    private var statusHint: some View {
+    private var hint: some View {
         if provider.needsSetup {
-            Text("This provider still has placeholder values. Fill them in under Settings.")
+            Text("Still has placeholder values. Fill them in under Settings.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.white.opacity(0.92))
         } else if provider.status == .keyMissing {
-            Text("A key stored in your Keychain is missing. Enter it again under Settings.")
+            Text("A key in your Keychain is missing. Enter it again under Settings.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.white.opacity(0.92))
         }
     }
 }
@@ -114,7 +145,7 @@ struct LaunchSection: View {
     }
 
     var body: some View {
-        Section("Launch") {
+        Section {
             LabeledContent("Project folder") {
                 HStack(spacing: 8) {
                     Text((store.folder as NSString).abbreviatingWithTildeInPath)
@@ -159,11 +190,13 @@ struct LaunchSection: View {
                     Label("Launch Claude Code", systemImage: "play.fill")
                         .padding(.horizontal, 6)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(GradientButtonStyle(accent: provider.accent))
                 .controlSize(.large)
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!folderExists || provider.needsSetup)
             }
+        } header: {
+            SectionTitle(text: "Launch", symbol: "play.circle.fill", color: provider.accent.a)
         }
     }
 }
@@ -176,13 +209,14 @@ struct ConnectionSection: View {
     let provider: Provider
 
     var body: some View {
-        Section("Connection") {
+        Section {
             HStack {
                 Button {
                     Task { await store.test(provider.name) }
                 } label: {
-                    Text("Test connection")
+                    Label("Test connection", systemImage: "bolt.horizontal.fill")
                 }
+                .buttonStyle(SoftButtonStyle(color: provider.accent.a))
                 .disabled(store.testing.contains(provider.name) || provider.needsSetup)
                 if store.testing.contains(provider.name) {
                     ProgressView().controlSize(.small)
@@ -191,25 +225,43 @@ struct ConnectionSection: View {
                 }
                 Spacer()
             }
-            if let r = store.testResults[provider.name] {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: r.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
-                        .foregroundStyle(r.ok ? Color.green : Color.red)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(r.ok ? "Working" : "Failed")
-                            .font(.headline)
-                        Text(r.message)
-                            .font(.system(.callout, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                        Text("Took \(String(format: "%.1f", r.seconds)) s")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
+            VStack {
+                if let r = store.testResults[provider.name] {
+                    result(r)
+                        .transition(.scale(scale: 0.96).combined(with: .opacity))
                 }
-                .accessibilityElement(children: .combine)
             }
+            .animation(.spring(response: 0.4, dampingFraction: 0.75),
+                       value: store.testResults[provider.name]?.date)
+        } header: {
+            SectionTitle(text: "Connection", symbol: "bolt.horizontal.circle.fill", color: provider.accent.a)
         }
+    }
+
+    private func result(_ r: TestResult) -> some View {
+        let color: Color = r.ok ? Color.green : Color.red
+        return HStack(alignment: .top, spacing: 10) {
+            Image(systemName: r.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                .font(.title2)
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(r.ok ? "Working" : "Failed")
+                    .font(.headline)
+                Text(r.message)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Text("Took \(String(format: "%.1f", r.seconds)) s")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(color.opacity(0.12)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(color.opacity(0.35), lineWidth: 1))
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -221,12 +273,21 @@ struct UsageSection: View {
     let provider: Provider
 
     var body: some View {
-        Section("Usage") {
+        Section {
             if let report = store.usage {
                 if let u = report.usage(for: provider.name) {
                     LabeledContent(store.usageRange.label) {
                         Text("\(u.requests.formatted()) requests · \(compactCount(u.input + u.output)) tokens")
                             .monospacedDigit()
+                    }
+                    if report.totalRequests > 0 {
+                        let share = Double(u.requests) / Double(report.totalRequests)
+                        VStack(alignment: .leading, spacing: 4) {
+                            ShareBar(fraction: share, accent: provider.accent)
+                            Text("\(Int((share * 100).rounded()))% of all requests")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 } else {
                     LabeledContent(store.usageRange.label) {
@@ -244,6 +305,8 @@ struct UsageSection: View {
                 Button("See all usage") { store.selection = .usage }
                     .buttonStyle(.link)
             }
+        } header: {
+            SectionTitle(text: "Usage", symbol: "chart.bar.fill", color: provider.accent.a)
         }
     }
 }
@@ -331,7 +394,7 @@ struct SettingsSection: View {
     }
 
     var body: some View {
-        Section("Settings") {
+        Section {
             if let t = template, !t.fields.isEmpty {
                 ForEach(t.fields) { f in
                     if f.kind == .secret {
@@ -354,7 +417,7 @@ struct SettingsSection: View {
                     Button("Revert") { load() }
                         .disabled(!isDirty || saving)
                     Button("Save changes") { save() }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(GradientButtonStyle(accent: provider.accent))
                         .disabled(!isDirty || !isValid || saving)
                 }
             } else if provider.templateName == nil {
@@ -386,6 +449,8 @@ struct SettingsSection: View {
                     .disabled(raw == provider.raw)
                 }
             }
+        } header: {
+            SectionTitle(text: "Settings", symbol: "slider.horizontal.3", color: provider.accent.a)
         }
         .onAppear {
             load()
@@ -414,7 +479,7 @@ struct EnvironmentSection: View {
 
     var body: some View {
         Section {
-            DisclosureGroup("What Claude Code will see", isExpanded: $expanded) {
+            DisclosureGroup(isExpanded: $expanded) {
                 if loading {
                     HStack {
                         ProgressView().controlSize(.small)
@@ -441,6 +506,8 @@ struct EnvironmentSection: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+            } label: {
+                SectionTitle(text: "What Claude Code will see", symbol: "eye.fill", color: provider.accent.a)
             }
         }
         .onChange(of: expanded) { _, now in
@@ -464,9 +531,13 @@ struct ManageSection: View {
     var body: some View {
         Section {
             HStack {
-                Button("Make default") {
+                Button {
                     Task { await store.setDefault(provider.name) }
+                } label: {
+                    Label(provider.isDefault ? "Default for claude" : "Make default",
+                          systemImage: provider.isDefault ? "star.fill" : "star")
                 }
+                .buttonStyle(SoftButtonStyle(color: Color.orange))
                 .disabled(provider.isDefault)
                 Spacer()
                 Button("Delete…", role: .destructive) { confirmDelete = true }
