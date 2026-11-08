@@ -7,6 +7,23 @@ A Claude Code provider switcher for macOS. Choose which cloud Claude Code talks 
 - Keep API keys and tokens in the macOS Keychain, not in files.
 - See how much each provider has been used.
 
+<p align="center">
+  <img src="https://github.com/joinalahmed/claude-switchboard/releases/download/v1.1.0/shot-vertex.jpg" alt="A provider page: Vertex AI, with a blue banner, launch and test buttons" width="880">
+</p>
+
+<table>
+  <tr>
+    <td width="50%"><img src="https://github.com/joinalahmed/claude-switchboard/releases/download/v1.1.0/shot-add.jpg" alt="Choosing a provider type: each type has its own color and mark"></td>
+    <td width="50%"><img src="https://github.com/joinalahmed/claude-switchboard/releases/download/v1.1.0/shot-litellm.jpg" alt="The same page for a LiteLLM provider, in green"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="https://github.com/joinalahmed/claude-switchboard/releases/download/v1.1.0/shot-usage.jpg" alt="Usage: requests and tokens per provider, per day and per model"></td>
+    <td width="50%"><img src="https://github.com/joinalahmed/claude-switchboard/releases/download/v1.1.0/shot-terminal.jpg" alt="Terminal: which provider plain claude uses"></td>
+  </tr>
+</table>
+
+Every provider type has its own colors, mark and banner pattern, so you can tell at a glance which cloud you are about to use. The screenshots are hosted with the release, not in the repository.
+
 ## Install
 
 ### Download (easiest)
@@ -115,7 +132,7 @@ Keychain items named `ccp-*` can be removed in Keychain Access, or with `ccp rem
 Pushing a version tag builds the app on GitHub (universal binary, ad-hoc signed) and attaches it to a release:
 
 ```sh
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.1.0 && git push origin v1.1.0
 ```
 
 The repository holds no image files. The app icon is drawn from `app/icon.swift` when the app is built.
