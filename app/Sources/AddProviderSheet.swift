@@ -142,7 +142,7 @@ struct AddProviderSheet: View {
     private func formView(_ t: Template) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
-                GradientTile(symbol: t.symbol, accent: t.accent, size: 46)
+                GradientTile(symbol: t.symbol, accent: t.accent, size: 46, kind: t.kind)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(t.name).font(.system(size: 22, weight: .bold, design: .rounded))
                     Text(t.summary).foregroundStyle(.secondary).font(.callout)
@@ -232,7 +232,7 @@ struct TemplateCard: View {
         let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
         let accent = template.accent
         return HStack(alignment: .top, spacing: 12) {
-            GradientTile(symbol: template.symbol, accent: accent, size: 38)
+            GradientTile(symbol: template.symbol, accent: accent, size: 38, kind: template.kind)
             VStack(alignment: .leading, spacing: 3) {
                 Text(template.name)
                     .font(.headline)

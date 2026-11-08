@@ -46,7 +46,7 @@ struct HeroSection: View {
         return Section {
             ZStack {
                 shape.fill(accent.gradient)
-                CableDecoration()
+                ProviderMotif(kind: provider.kind)
                 shape.fill(LinearGradient(colors: [Color.clear, Color.black.opacity(0.2)],
                                           startPoint: .top, endPoint: .bottom))
                 content
@@ -66,10 +66,7 @@ struct HeroSection: View {
                     .fill(Color.white.opacity(0.22))
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
                     .strokeBorder(Color.white.opacity(0.45), lineWidth: 1)
-                Image(systemName: symbol)
-                    .font(.system(size: 36, weight: .semibold))
-                    .foregroundStyle(Color.white)
-                    .shadow(color: Color.black.opacity(0.2), radius: 2, y: 1)
+                ProviderMark(kind: provider.kind, fallback: symbol, size: 84)
             }
             .frame(width: 78, height: 78)
             .accessibilityHidden(true)
@@ -83,6 +80,9 @@ struct HeroSection: View {
                     .foregroundStyle(Color.white.opacity(0.9))
                     .lineLimit(2)
                 HStack(spacing: 8) {
+                    if let k = provider.kind {
+                        HeroChip(text: k.vendor)
+                    }
                     HeroChip(text: provider.status.label, symbol: provider.status.symbol)
                     if provider.isDefault {
                         HeroChip(text: "Default for claude", symbol: "star.fill")

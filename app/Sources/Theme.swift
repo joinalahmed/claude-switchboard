@@ -26,11 +26,11 @@ struct Accent: Equatable {
 enum Palette {
     static let brand = Accent(a: Color(hex: 0x7C5CFF), b: Color(hex: 0xFF5C9D))
 
-    static let coral = Accent(a: Color(hex: 0xFF8A5B), b: Color(hex: 0xE5484D))
+    static let coral = Accent(a: Color(hex: 0xE8825E), b: Color(hex: 0xB9482B))
     static let rose = Accent(a: Color(hex: 0xFF6FA5), b: Color(hex: 0xB8338C))
-    static let sky = Accent(a: Color(hex: 0x3B82F6), b: Color(hex: 0x06B6D4))
-    static let amber = Accent(a: Color(hex: 0xF59E0B), b: Color(hex: 0xEA580C))
-    static let teal = Accent(a: Color(hex: 0x0D9488), b: Color(hex: 0x2DD4BF))
+    static let sky = Accent(a: Color(hex: 0x4285F4), b: Color(hex: 0x1FA2E8))
+    static let amber = Accent(a: Color(hex: 0xFF9900), b: Color(hex: 0xC2410C))
+    static let teal = Accent(a: Color(hex: 0x0078D4), b: Color(hex: 0x2BC6D8))
     static let violet = Accent(a: Color(hex: 0x8B5CF6), b: Color(hex: 0xD946EF))
     static let lime = Accent(a: Color(hex: 0x16A34A), b: Color(hex: 0x84CC16))
     static let slate = Accent(a: Color(hex: 0x6366F1), b: Color(hex: 0x64748B))
@@ -47,35 +47,8 @@ enum Palette {
 
     /// The color of a provider: by its type, then by words in its name, then a stable hue made from the name.
     static func accent(template: String?, name: String) -> Accent {
-        if let t = template, let hit = byTemplate(t) { return hit }
-        if let hit = byWord(name) { return hit }
+        if let k = ProviderKind(template: template, name: name) { return k.accent }
         return hashed(name)
-    }
-
-    private static func byTemplate(_ t: String) -> Accent? {
-        switch t {
-        case "anthropic": return coral
-        case "anthropic-login": return rose
-        case "vertex": return sky
-        case "bedrock": return amber
-        case "foundry": return teal
-        case "gateway": return violet
-        case "litellm": return lime
-        case "custom": return slate
-        default: return nil
-        }
-    }
-
-    private static func byWord(_ name: String) -> Accent? {
-        let n = name.lowercased()
-        if n.contains("login") || n.contains("subscription") { return rose }
-        if n.contains("vertex") || n.contains("gcp") || n.contains("google") { return sky }
-        if n.contains("bedrock") || n.contains("aws") { return amber }
-        if n.contains("foundry") || n.contains("azure") { return teal }
-        if n.contains("litellm") { return lime }
-        if n.contains("gateway") || n.contains("proxy") { return violet }
-        if n.contains("anthropic") || n.contains("api") { return coral }
-        return nil
     }
 
     /// Swift's own hashValue changes on every launch, so the hue is built from the characters instead.
@@ -93,11 +66,331 @@ extension Provider {
     var accent: Accent {
         return Palette.accent(template: templateName, name: name)
     }
+
+    var kind: ProviderKind? {
+        return ProviderKind(template: templateName, name: name)
+    }
 }
 
 extension Template {
     var accent: Accent {
         return Palette.accent(template: name, name: name)
+    }
+
+    var kind: ProviderKind? {
+        return ProviderKind(template: name, name: name)
+    }
+}
+
+// MARK: - Provider looks
+
+/// The kinds of provider that get their own mark, colors and background pattern.
+enum ProviderKind: String {
+    case anthropic, login, vertex, bedrock, foundry, gateway, litellm, custom
+
+    init?(template: String?, name: String) {
+        if let t = template, let k = ProviderKind(templateName: t) {
+            self = k
+            return
+        }
+        if let k = ProviderKind(word: name) {
+            self = k
+            return
+        }
+        return nil
+    }
+
+    init?(templateName t: String) {
+        switch t {
+        case "anthropic": self = .anthropic
+        case "anthropic-login": self = .login
+        case "vertex": self = .vertex
+        case "bedrock": self = .bedrock
+        case "foundry": self = .foundry
+        case "gateway": self = .gateway
+        case "litellm": self = .litellm
+        case "custom": self = .custom
+        default: return nil
+        }
+    }
+
+    init?(word name: String) {
+        let n = name.lowercased()
+        if n.contains("login") || n.contains("subscription") { self = .login }
+        else if n.contains("vertex") || n.contains("gcp") || n.contains("google") { self = .vertex }
+        else if n.contains("bedrock") || n.contains("aws") { self = .bedrock }
+        else if n.contains("foundry") || n.contains("azure") { self = .foundry }
+        else if n.contains("litellm") { self = .litellm }
+        else if n.contains("gateway") || n.contains("proxy") { self = .gateway }
+        else if n.contains("anthropic") || n.contains("api") { self = .anthropic }
+        else { return nil }
+    }
+
+    var accent: Accent {
+        switch self {
+        case .anthropic: return Palette.coral
+        case .login: return Palette.rose
+        case .vertex: return Palette.sky
+        case .bedrock: return Palette.amber
+        case .foundry: return Palette.teal
+        case .gateway: return Palette.violet
+        case .litellm: return Palette.lime
+        case .custom: return Palette.slate
+        }
+    }
+
+    /// Who runs it, in plain words.
+    var vendor: String {
+        switch self {
+        case .anthropic: return "Anthropic API"
+        case .login: return "Claude subscription"
+        case .vertex: return "Google Cloud"
+        case .bedrock: return "Amazon Web Services"
+        case .foundry: return "Microsoft Azure"
+        case .gateway: return "Your gateway"
+        case .litellm: return "LiteLLM proxy"
+        case .custom: return "Custom setup"
+        }
+    }
+
+    /// A symbol for kinds that have no drawn mark.
+    var symbol: String? {
+        switch self {
+        case .anthropic: return "key.fill"
+        case .login: return "person.crop.circle.fill"
+        case .custom: return "slider.horizontal.3"
+        default: return nil
+        }
+    }
+}
+
+/// Simple marks drawn by hand. They are original shapes in each provider's colors, not the companies' logos.
+struct VertexMarkShape: Shape {
+    func path(in r: CGRect) -> Path {
+        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: r.minX + r.width * x, y: r.minY + r.height * y) }
+        let top = pt(0.5, 0.1), left = pt(0.1, 0.82), right = pt(0.9, 0.82), mid = pt(0.5, 0.58)
+        var p = Path()
+        for a in [top, left, right] {
+            p.move(to: mid)
+            p.addLine(to: a)
+        }
+        p.move(to: left)
+        p.addLine(to: right)
+        let rad = r.width * 0.11
+        for c in [top, left, right] {
+            p.addEllipse(in: CGRect(x: c.x - rad, y: c.y - rad, width: rad * 2, height: rad * 2))
+        }
+        let small = r.width * 0.07
+        p.addEllipse(in: CGRect(x: mid.x - small, y: mid.y - small, width: small * 2, height: small * 2))
+        return p
+    }
+}
+
+struct BedrockMarkShape: Shape {
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        let rows: [(CGFloat, CGFloat)] = [(0.28, 0.44), (0.16, 0.68), (0.04, 0.92)]
+        for (i, row) in rows.enumerated() {
+            let y = r.minY + r.height * (0.08 + 0.31 * CGFloat(i))
+            let box = CGRect(x: r.minX + r.width * row.0, y: y, width: r.width * row.1, height: r.height * 0.2)
+            p.addRoundedRect(in: box, cornerSize: CGSize(width: r.width * 0.06, height: r.width * 0.06))
+        }
+        return p
+    }
+}
+
+struct FoundryMarkShape: Shape {
+    func path(in r: CGRect) -> Path {
+        func hex(_ radius: CGFloat) -> Path {
+            var h = Path()
+            let c = CGPoint(x: r.midX, y: r.midY)
+            for i in 0..<6 {
+                let ang = CGFloat(i) * .pi / 3 - .pi / 2
+                let q = CGPoint(x: c.x + radius * cos(ang), y: c.y + radius * sin(ang))
+                if i == 0 { h.move(to: q) } else { h.addLine(to: q) }
+            }
+            h.closeSubpath()
+            return h
+        }
+        var p = hex(r.width * 0.46)
+        p.addPath(hex(r.width * 0.2))
+        return p
+    }
+}
+
+struct RouterMarkShape: Shape {
+    func path(in r: CGRect) -> Path {
+        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: r.minX + r.width * x, y: r.minY + r.height * y) }
+        var p = Path()
+        p.move(to: pt(0.06, 0.5))
+        p.addLine(to: pt(0.4, 0.5))
+        for y in [CGFloat(0.14), 0.5, 0.86] {
+            p.move(to: pt(0.4, 0.5))
+            p.addCurve(to: pt(0.82, y), control1: pt(0.6, 0.5), control2: pt(0.62, y))
+            let c = pt(0.88, y)
+            p.addEllipse(in: CGRect(x: c.x - r.width * 0.06, y: c.y - r.width * 0.06, width: r.width * 0.12, height: r.width * 0.12))
+        }
+        return p
+    }
+}
+
+struct GatewayMarkShape: Shape {
+    func path(in r: CGRect) -> Path {
+        func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: r.minX + r.width * x, y: r.minY + r.height * y) }
+        var p = Path()
+        p.move(to: pt(0.18, 0.9))
+        p.addLine(to: pt(0.18, 0.45))
+        p.addCurve(to: pt(0.82, 0.45), control1: pt(0.18, 0.0), control2: pt(0.82, 0.0))
+        p.addLine(to: pt(0.82, 0.9))
+        p.move(to: pt(0.05, 0.9))
+        p.addLine(to: pt(0.95, 0.9))
+        p.move(to: pt(0.5, 0.9))
+        p.addLine(to: pt(0.5, 0.5))
+        return p
+    }
+}
+
+/// The glyph in a provider's tile.
+struct ProviderMark: View {
+    let kind: ProviderKind?
+    let fallback: String
+    let size: CGFloat
+
+    var body: some View {
+        let lw = max(1.6, size * 0.075)
+        let style = StrokeStyle(lineWidth: lw, lineCap: .round, lineJoin: .round)
+        return Group {
+            switch kind {
+            case .some(.vertex):
+                VertexMarkShape().stroke(Color.white, style: style)
+            case .some(.bedrock):
+                BedrockMarkShape().fill(Color.white)
+            case .some(.foundry):
+                FoundryMarkShape().stroke(Color.white, style: style)
+            case .some(.litellm):
+                RouterMarkShape().stroke(Color.white, style: style)
+            case .some(.gateway):
+                GatewayMarkShape().stroke(Color.white, style: style)
+            default:
+                Image(systemName: kind?.symbol ?? fallback)
+                    .font(.system(size: size * 0.5, weight: .semibold))
+                    .foregroundStyle(Color.white)
+            }
+        }
+        .frame(width: size * 0.54, height: size * 0.54)
+        .shadow(color: Color.black.opacity(0.22), radius: 1, y: 1)
+    }
+}
+
+/// A faint pattern on a provider's banner that fits what the provider is.
+struct ProviderMotif: View {
+    let kind: ProviderKind?
+
+    var body: some View {
+        switch kind {
+        case .some(let k):
+            Canvas { ctx, size in
+                draw(k, ctx: &ctx, size: size)
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        case .none:
+            CableDecoration()
+        }
+    }
+
+    private func line(_ ctx: inout GraphicsContext, _ path: Path, _ opacity: Double, _ width: CGFloat) {
+        ctx.stroke(path, with: .color(Color.white.opacity(opacity)), lineWidth: width)
+    }
+
+    private func dot(_ ctx: inout GraphicsContext, _ c: CGPoint, _ r: CGFloat, _ opacity: Double) {
+        ctx.fill(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)), with: .color(Color.white.opacity(opacity)))
+    }
+
+    private func draw(_ k: ProviderKind, ctx: inout GraphicsContext, size: CGSize) {
+        let w = size.width, h = size.height
+        switch k {
+        case .vertex:
+            let pts: [CGPoint] = [CGPoint(x: w * 0.56, y: h * 0.22), CGPoint(x: w * 0.7, y: h * 0.62), CGPoint(x: w * 0.82, y: h * 0.2),
+                                  CGPoint(x: w * 0.93, y: h * 0.55), CGPoint(x: w * 0.62, y: h * 0.92), CGPoint(x: w * 0.88, y: h * 0.9)]
+            let edges: [(Int, Int)] = [(0, 1), (1, 2), (0, 2), (2, 3), (1, 3), (1, 4), (3, 5), (4, 5)]
+            var p = Path()
+            for e in edges {
+                p.move(to: pts[e.0])
+                p.addLine(to: pts[e.1])
+            }
+            line(&ctx, p, 0.2, 1.5)
+            for c in pts { dot(&ctx, c, 5, 0.32) }
+        case .bedrock:
+            for i in 0..<6 {
+                let y = h * (0.02 + 0.17 * CGFloat(i))
+                var p = Path()
+                p.move(to: CGPoint(x: w * 0.38, y: y + h * 0.24))
+                p.addLine(to: CGPoint(x: w * 1.05, y: y))
+                p.addLine(to: CGPoint(x: w * 1.05, y: y + h * 0.1))
+                p.addLine(to: CGPoint(x: w * 0.38, y: y + h * 0.34))
+                p.closeSubpath()
+                ctx.fill(p, with: .color(Color.white.opacity(0.05 + 0.02 * Double(i))))
+            }
+        case .foundry:
+            let r: CGFloat = 26
+            let dx = r * 1.732, dy = r * 1.5
+            var p = Path()
+            for row in 0..<7 {
+                for col in 0..<7 {
+                    let cx = w * 0.55 + CGFloat(col) * dx + (row % 2 == 0 ? 0 : dx / 2)
+                    let cy = -r + CGFloat(row) * dy
+                    for i in 0..<6 {
+                        let a = CGFloat(i) * .pi / 3 - .pi / 2
+                        let q = CGPoint(x: cx + r * cos(a), y: cy + r * sin(a))
+                        if i == 0 { p.move(to: q) } else { p.addLine(to: q) }
+                    }
+                    p.closeSubpath()
+                }
+            }
+            line(&ctx, p, 0.15, 1.4)
+        case .litellm:
+            var p = Path()
+            let origin = CGPoint(x: w * 0.5, y: h * 0.5)
+            for i in 0..<5 {
+                let y = h * (0.08 + 0.21 * CGFloat(i))
+                let end = CGPoint(x: w * 0.97, y: y)
+                p.move(to: origin)
+                p.addCurve(to: end, control1: CGPoint(x: w * 0.7, y: origin.y), control2: CGPoint(x: w * 0.76, y: y))
+                dot(&ctx, end, 5, 0.32)
+            }
+            line(&ctx, p, 0.22, 2.2)
+            dot(&ctx, origin, 7, 0.4)
+        case .gateway:
+            let c = CGPoint(x: w * 0.95, y: h * 0.5)
+            for i in 1...5 {
+                let r = CGFloat(i) * 38
+                line(&ctx, Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)), 0.2 - 0.025 * Double(i), 2)
+            }
+        case .anthropic:
+            let c = CGPoint(x: w * 0.88, y: h * 0.45)
+            for i in 1...4 {
+                let r = CGFloat(i) * 34
+                line(&ctx, Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)), 0.2 - 0.03 * Double(i), 1.6)
+            }
+            for i in 0..<14 {
+                let a = CGFloat(i) / 14 * 2 * .pi
+                dot(&ctx, CGPoint(x: c.x + 150 * cos(a), y: c.y + 150 * sin(a)), 2.5, 0.25)
+            }
+        case .login:
+            dot(&ctx, CGPoint(x: w * 0.86, y: h * 0.32), 40, 0.14)
+            ctx.fill(Path(ellipseIn: CGRect(x: w * 0.7, y: h * 0.62, width: 190, height: 190)), with: .color(Color.white.opacity(0.12)))
+            dot(&ctx, CGPoint(x: w * 0.62, y: h * 0.2), 10, 0.2)
+        case .custom:
+            for i in 0..<4 {
+                let y = h * (0.2 + 0.2 * CGFloat(i))
+                var p = Path()
+                p.move(to: CGPoint(x: w * 0.5, y: y))
+                p.addLine(to: CGPoint(x: w * 0.97, y: y))
+                line(&ctx, p, 0.2, 2.5)
+                dot(&ctx, CGPoint(x: w * (0.58 + 0.09 * CGFloat((i * 3) % 4)), y: y), 7, 0.38)
+            }
+        }
     }
 }
 
@@ -108,6 +401,7 @@ struct GradientTile: View {
     let symbol: String
     let accent: Accent
     var size: CGFloat = 32
+    var kind: ProviderKind? = nil
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
@@ -121,10 +415,7 @@ struct GradientTile: View {
                     lineWidth: 1)
             )
             .overlay(
-                Image(systemName: symbol)
-                    .font(.system(size: size * 0.5, weight: .semibold))
-                    .foregroundStyle(Color.white)
-                    .shadow(color: Color.black.opacity(0.22), radius: 1, y: 1)
+                ProviderMark(kind: kind, fallback: symbol, size: size)
             )
             .shadow(color: accent.a.opacity(0.4), radius: size * 0.2, y: size * 0.08)
             .accessibilityHidden(true)

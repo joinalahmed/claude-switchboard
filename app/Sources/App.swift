@@ -140,7 +140,8 @@ struct EmptyDetail: View {
         VStack(spacing: 20) {
             HStack(spacing: 14) {
                 ForEach(Array(samples.enumerated()), id: \.offset) { i, item in
-                    GradientTile(symbol: item.1, accent: Palette.accent(template: item.0, name: item.0), size: 58)
+                    GradientTile(symbol: item.1, accent: Palette.accent(template: item.0, name: item.0), size: 58,
+                                 kind: ProviderKind(templateName: item.0))
                         .rotationEffect(.degrees(i % 2 == 0 ? -6 : 6))
                         .offset(y: i % 2 == 0 ? 0 : 10)
                 }
@@ -273,7 +274,7 @@ struct ProviderRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            GradientTile(symbol: symbol, accent: provider.accent, size: 30)
+            GradientTile(symbol: symbol, accent: provider.accent, size: 30, kind: provider.kind)
                 .overlay(alignment: .bottomTrailing) {
                     if provider.status != .ready {
                         Circle()

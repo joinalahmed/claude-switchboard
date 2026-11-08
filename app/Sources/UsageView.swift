@@ -264,7 +264,8 @@ struct UsageView: View {
     private func providerRow(_ p: ProviderUsage, total: Int, accent: Accent) -> some View {
         let share = total > 0 ? Double(p.requests) / Double(total) : 0
         return HStack(alignment: .top, spacing: 12) {
-            GradientTile(symbol: symbol(for: p.provider), accent: accent, size: 34)
+            GradientTile(symbol: symbol(for: p.provider), accent: accent, size: 34,
+                         kind: store.provider(named: p.provider)?.kind)
             VStack(alignment: .leading, spacing: 5) {
                 HStack {
                     Text(p.provider).font(.headline)

@@ -45,6 +45,7 @@ struct TerminalView: View {
                 FlowCard(active: hookOn && defaultProvider != nil,
                          providerName: defaultProvider?.name ?? "no provider",
                          symbol: defaultSymbol,
+                         kind: defaultProvider?.kind,
                          accent: defaultProvider?.accent ?? Palette.other)
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                     .listRowBackground(Color.clear)
@@ -172,6 +173,7 @@ struct FlowCard: View {
     let active: Bool
     let providerName: String
     let symbol: String
+    let kind: ProviderKind?
     let accent: Accent
 
     @State private var phase: CGFloat = 0
@@ -192,7 +194,7 @@ struct FlowCard: View {
         return VStack(spacing: 14) {
             HStack(spacing: 0) {
                 node(title: "claude", subtitle: "what you type", symbol: "chevron.right.square.fill",
-                     accent: Palette.terminal, dim: false)
+                     accent: Palette.terminal, dim: false, kind: nil)
                 HorizontalLine()
                     .stroke(line, style: StrokeStyle(lineWidth: 4, lineCap: .round, dash: [2, 10], dashPhase: phase))
                     .frame(height: 4)
@@ -200,7 +202,7 @@ struct FlowCard: View {
                     .padding(.horizontal, 10)
                     .offset(y: -14)
                 node(title: providerName, subtitle: active ? "where it goes" : "not connected", symbol: symbol,
-                     accent: active ? accent : Palette.other, dim: !active)
+                     accent: active ? accent : Palette.other, dim: !active, kind: kind)
             }
             Text(active ? "Typing claude in Terminal runs Claude Code with \(providerName)."
                         : "Plain claude ignores this app and uses your shell's own settings.")
@@ -219,9 +221,9 @@ struct FlowCard: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func node(title: String, subtitle: String, symbol: String, accent: Accent, dim: Bool) -> some View {
+    private func node(title: String, subtitle: String, symbol: String, accent: Accent, dim: Bool, kind: ProviderKind?) -> some View {
         VStack(spacing: 6) {
-            GradientTile(symbol: symbol, accent: accent, size: 60)
+            GradientTile(symbol: symbol, accent: accent, size: 60, kind: kind)
                 .opacity(dim ? 0.6 : 1.0)
             Text(title)
                 .font(.system(.headline, design: .rounded))
