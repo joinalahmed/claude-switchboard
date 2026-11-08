@@ -64,10 +64,12 @@ enum Palette {
 
 extension Provider {
     var accent: Accent {
-        return Palette.accent(template: templateName, name: name)
+        return kind?.accent ?? Palette.hashed(name)
     }
 
+    /// A "# kind:" header (written by `ccp import`) wins over the template and the name.
     var kind: ProviderKind? {
+        if let h = kindHint, let k = ProviderKind(templateName: h) { return k }
         return ProviderKind(template: templateName, name: name)
     }
 }

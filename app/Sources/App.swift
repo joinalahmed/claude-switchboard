@@ -84,16 +84,20 @@ struct RootView: View {
         }
         .overlay(alignment: .bottom) {
             if let message = store.toast {
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
+                let accent = store.toastIsError ? Palette.danger : Palette.brand
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: store.toastIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                     Text(message)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
                 }
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(Color.white)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 9)
-                .background(Capsule().fill(Palette.brand.gradient))
-                .shadow(color: Palette.brand.a.opacity(0.45), radius: 12, y: 5)
+                .frame(maxWidth: 560)
+                .background(Capsule().fill(accent.gradient))
+                .shadow(color: accent.a.opacity(0.45), radius: 12, y: 5)
                 .padding(.bottom, 20)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .accessibilityAddTraits(.updatesFrequently)
@@ -116,8 +120,8 @@ struct DetailRouter: View {
             } else {
                 EmptyDetail()
             }
-        case .some(.terminal):
-            TerminalView()
+        case .some(.switcher):
+            SwitchView()
         case .some(.usage):
             UsageView()
         case .some(.health):
@@ -187,8 +191,9 @@ struct SidebarView: View {
                 }
             }
             Section("Tools") {
-                ToolRow(title: "Terminal", subtitle: "What claude runs", symbol: "terminal.fill", accent: Palette.terminal)
-                    .tag(SidebarItem.terminal)
+                ToolRow(title: "Switch", subtitle: store.status?.active.isEmpty == false ? "claude uses \(store.status!.active)" : "Which provider claude uses",
+                        symbol: "arrow.triangle.swap", accent: Palette.terminal)
+                    .tag(SidebarItem.switcher)
                 ToolRow(title: "Usage", subtitle: "Per provider", symbol: "chart.bar.xaxis", accent: Palette.usage)
                     .tag(SidebarItem.usage)
                 ToolRow(title: "Health check", subtitle: "Find what gets in the way", symbol: "stethoscope", accent: Palette.health)
@@ -292,20 +297,20 @@ struct ProviderRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            if provider.isDefault {
+            if provider.isActive {
                 HStack(spacing: 3) {
                     GlowDot(color: Color.green, size: 6)
                         .frame(width: 14, height: 14)
-                    Text("default")
+                    Text("active")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(Color.green)
                 }
-                .help("Plain claude in Terminal uses this provider")
+                .help("claude uses this provider now")
             }
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(provider.name), \(provider.status.label)\(provider.isDefault ? ", default" : "")")
+        .accessibilityLabel("\(provider.name), \(provider.status.label)\(provider.isActive ? ", active" : "")")
     }
 }
 
@@ -315,10 +320,18 @@ struct MenuBarContent: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Text("Launch in \((store.folder as NSString).abbreviatingWithTildeInPath)")
+        Text(store.status?.active.isEmpty == false ? "claude uses \(store.status!.active)" : "No provider is active")
         ForEach(store.providers) { p in
-            Button(p.isDefault ? "\(p.name) (default)" : p.name) {
-                store.launch(p.name)
+            Toggle(isOn: Binding(get: { p.isActive }, set: { on in if on { Task { await store.activate(p.name) } } })) {
+                Text(p.name)
+            }
+            .disabled(p.status != .ready || store.switching != nil)
+        }
+        Divider()
+        Menu("Launch in \((store.folder as NSString).abbreviatingWithTildeInPath)") {
+            ForEach(store.providers) { p in
+                Button(p.name) { store.launch(p.name) }
+                    .disabled(p.needsSetup)
             }
         }
         Divider()

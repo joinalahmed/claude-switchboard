@@ -17,13 +17,14 @@ final class Store: ObservableObject {
     @Published var showAdd = false
     @Published var loaded = false
     @Published var toast: String? = nil
+    @Published var toastIsError = false
     @Published var testResults: [String: TestResult] = [:]
     @Published var testing: Set<String> = []
 
-    // Terminal integration
-    @Published var hook: HookStatus? = nil
-    @Published var overrides: [OverrideEntry] = []
-    @Published var terminalBusy = false
+    // Switching
+    @Published var status: SwitchStatus? = nil
+    @Published var switching: String? = nil
+    @Published var switchBusy = false
 
     // Usage
     @Published var usage: UsageReport? = nil
@@ -63,10 +64,19 @@ final class Store: ObservableObject {
         extraArgs = d.string(forKey: "extraArgs") ?? ""
         terminal = TerminalApp(rawValue: d.string(forKey: "terminal") ?? "") ?? .terminal
         usageRange = UsageRange(rawValue: d.string(forKey: "usageRange") ?? "") ?? .month
+        // SWITCHBOARD_PAGE=switch|usage|health opens that page first (handy for screenshots).
+        let startPage: SidebarItem?
+        switch env["SWITCHBOARD_PAGE"] ?? "" {
+        case "switch": startPage = .switcher
+        case "usage": startPage = .usage
+        case "health": startPage = .health
+        default: startPage = nil
+        }
         Task.detached { _ = Shell.loginPath }
         Task {
             await self.refresh()
-            await self.refreshTerminal()
+            if let page = startPage { self.selection = page }
+            await self.refreshSwitch()
             await self.loadUsage()
         }
     }
@@ -77,8 +87,8 @@ final class Store: ObservableObject {
         let d = dir
         let snap: Snapshot = await withCheckedContinuation { (cont: CheckedContinuation<Snapshot, Never>) in
             DispatchQueue.global().async {
-                let def = Catalog.defaultName(dir: d)
-                let providers = Catalog.loadProviders(dir: d, defaultName: def)
+                let active = Catalog.activeName(dir: d)
+                let providers = Catalog.loadProviders(dir: d, activeName: active)
                 let templates = Catalog.loadTemplates(dir: d)
                 cont.resume(returning: Snapshot(providers: providers, templates: templates))
             }
@@ -101,7 +111,7 @@ final class Store: ObservableObject {
     }
 
     private func firstSelection() -> SidebarItem? {
-        if let p = providers.first(where: { $0.isDefault }) { return .provider(p.name) }
+        if let p = providers.first(where: { $0.isActive }) { return .provider(p.name) }
         if let p = providers.first { return .provider(p.name) }
         return nil
     }
@@ -112,7 +122,8 @@ final class Store: ObservableObject {
 
     // MARK: - Feedback
 
-    func show(_ message: String) {
+    func show(_ message: String, error: Bool = false) {
+        toastIsError = error
         toast = message
         toastTask?.cancel()
         toastTask = Task {
@@ -143,10 +154,10 @@ final class Store: ObservableObject {
 
     /// Creates a provider, or replaces one when `replace` is true. Returns an error message on failure.
     func saveProvider(name: String, template: String, values: [String: String],
-                      secrets: [String: String], makeDefault: Bool, replace: Bool) async -> String? {
+                      secrets: [String: String], activate: Bool, replace: Bool) async -> String? {
         var args = ["add", name, "-t", template, "--yes"]
         if replace { args += ["--force", "--keep"] }
-        if makeDefault { args.append("--default") }
+        if activate { args.append("--use") }
         for key in values.keys.sorted() {
             args += ["--set", "\(key)=\(values[key] ?? "")"]
         }
@@ -154,18 +165,22 @@ final class Store: ObservableObject {
         for (k, v) in secrets where !v.isEmpty { env["CCP_SECRET_\(k)"] = v }
         let r = await ccpRun(args, env: env)
         await refresh()
+        if activate { await refreshSwitch() }
         return r.ok ? nil : Store.summarize(r)
     }
 
-    func setDefault(_ name: String) async {
-        let r = await ccpRun(["default", name])
+    /// Makes `name` the provider every new Claude Code session uses, by writing Claude Code's settings through `ccp use`.
+    func activate(_ name: String) async {
+        guard switching == nil else { return }
+        switching = name
+        let r = await ccpRun(["use", name], timeout: 60)
         await refresh()
-        if !r.ok {
-            show(Store.summarize(r))
-        } else if hook?.installed == true {
-            show("\(name) is now the default. New Terminal windows will use it for claude.")
+        await refreshSwitch()
+        switching = nil
+        if r.ok {
+            show("Claude Code now uses \(name). Every new session picks it up.")
         } else {
-            show("\(name) is now the default")
+            show(Store.summarize(r), error: true)
         }
     }
 
@@ -271,6 +286,7 @@ final class Store: ObservableObject {
 
     private static func doctorTitle(_ s: String) -> String {
         if s.hasPrefix("claude") { return "Claude Code" }
+        if s.hasPrefix("active provider") { return "Active provider" }
         if s.hasPrefix("providers") { return "Providers" }
         if s.hasPrefix("things that could override") { return "Things that could override your choice" }
         return s

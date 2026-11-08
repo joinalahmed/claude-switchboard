@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
-# ccp — run Claude Code against a chosen provider, and manage providers.
+# ccp — choose which provider Claude Code uses, and manage providers.
+#
+# Switch:
+#   ccp use NAME                 make NAME the provider for every `claude` (Terminal, IDE, new windows)
+#   ccp use none                 hand control back to Claude Code's own sign-in
+#   ccp status                   which provider is active, and whether Claude Code's settings still match it
 #
 # Run:
-#   ccp                          use the default provider
-#   ccp NAME [claude args]       e.g.  ccp vertex -c
+#   ccp                          Claude Code with the active provider
+#   ccp NAME [claude args]       one session with another provider, e.g.  ccp vertex -c
 #
 # Manage providers (settings live in ~/.claude-providers):
-#   ccp list                     providers with descriptions (* = default)
+#   ccp list                     providers with descriptions (* = active)
 #   ccp templates                provider types you can add
 #   ccp add [NAME] [-t TYPE]     create a provider; asks for each value, secrets go to the Keychain
+#   ccp import NAME              turn the provider settings now in ~/.claude/settings.json into a provider
 #   ccp edit NAME                open NAME.env in your editor
 #   ccp key NAME [VAR]           (re)enter a secret stored in the Keychain
-#   ccp default NAME             set the default provider
 #   ccp remove NAME              delete a provider and its Keychain items
 #   ccp show [NAME]              print the resolved settings (secrets masked)
 #   ccp test [NAME]              make one real request through the provider
 #   ccp doctor                   look for things that override ccp
-#   ccp run [claude args]        always use the default provider (this is what the shell hook calls)
-#   ccp shell install|remove|status   make plain `claude` in your terminal follow the default provider
-#   ccp overrides [--fix]        find (and with --fix remove) provider variables in ~/.claude/settings*.json
+#   ccp overrides [--fix]        provider variables in ~/.claude/settings.json that ccp didn't put there
+#   ccp shell install|remove|status   optional: record plain `claude` launches for the Usage page
+#
+# How switching works: `ccp use` writes the provider's variables into the "env" block of
+# ~/.claude/settings.json, which Claude Code applies to every session wherever it starts. API keys and
+# tokens stay in the Keychain: Claude Code asks `ccp auth` for them (its apiKeyHelper setting).
+# Sessions already running keep their provider until restarted.
 #
 # Every launch is recorded in ~/.claude-providers/usage/runs.log (when, which provider, which folder)
 # so Switchboard can attribute Claude Code's token usage to providers.
@@ -31,16 +40,19 @@
 #   questions; {{NAME}} marks where answers go; a leading "?" drops a line when its answer is blank.
 # A NAME.env may define ccp_check() for custom pre-launch checks (use warn / die).
 #
-# Provider precedence: first argument > $CLAUDE_PROVIDER > default file > vertex.
+# Provider precedence for a launch: first argument > $CLAUDE_PROVIDER > the active provider.
 # CCP_DRY_RUN=1 prints the resolved settings instead of launching claude.
 
 set -u
-CCP_VERSION=1
+CCP_VERSION=2
 
 DIR="${CLAUDE_PROVIDERS_DIR:-$HOME/.claude-providers}"
 TPL_DIR="$DIR/templates"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+SETTINGS="$CLAUDE_DIR/settings.json"
+APPLIED="$DIR/applied"
 ACCOUNT="${USER:-$(id -un)}"
-RESERVED=" help list ls templates template template-vars secrets add new edit remove rm key show test doctor default run shell overrides usage "
+RESERVED=" help list ls templates template template-vars secrets add new edit remove rm key show test doctor default use status import auth run shell overrides usage none off "
 SETS=""; REPL=""; EMPTYV=" "
 
 die()  { echo "ccp: $*" >&2; exit 1; }
@@ -53,6 +65,17 @@ trim() {
   s="${s%"${s##*[![:space:]]}"}"
   printf '%s' "$s"
 }
+
+# Backslash-escape tabs, newlines and backslashes so a value fits on one tab-separated line.
+esc() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+is_secret_name() { case "$1" in *KEY*|*TOKEN*|*SECRET*|*PASSWORD*) return 0 ;; *) return 1 ;; esac; }
 
 # ---- Keychain ---------------------------------------------------------------
 have_security() { command -v security >/dev/null 2>&1; }
@@ -91,10 +114,13 @@ list_templates() {
     if [ -e "$f" ]; then basename "$f" .tpl; fi
   done
 }
+# The active provider: the one `ccp use` chose. Empty when none has been chosen.
+active_provider() {
+  if [ -f "$DIR/default" ]; then head -n1 "$DIR/default"; fi
+}
+# The provider a launch uses when none is named: $CLAUDE_PROVIDER, else the active one.
 default_provider() {
-  if [ -n "${CLAUDE_PROVIDER:-}" ]; then echo "$CLAUDE_PROVIDER"
-  elif [ -f "$DIR/default" ]; then head -n1 "$DIR/default"
-  else echo vertex; fi
+  if [ -n "${CLAUDE_PROVIDER:-}" ]; then echo "$CLAUDE_PROVIDER"; else active_provider; fi
 }
 desc_of() { sed -n 's/^# description:[[:space:]]*//p' "$1" | head -n1; }
 needs_setup() { grep -v '^[[:space:]]*#' "$1" | grep -q 'CHANGE_ME'; }
@@ -174,7 +200,7 @@ cmd_templates() {
 
 cmd_list() {
   local cur p f mark d st
-  cur="$(default_provider)"
+  cur="$(active_provider)"
   if [ -z "$(list_providers)" ]; then echo "No providers yet. Add one with: ccp add"; return 0; fi
   for p in $(list_providers); do
     f="$DIR/$p.env"; mark=" "
@@ -183,6 +209,7 @@ cmd_list() {
     if needs_setup "$f"; then st="   [needs setup: ccp edit $p]"; fi
     printf '%s %-14s %s%s\n' "$mark" "$p" "$d" "$st"
   done
+  if [ -z "$cur" ]; then echo "(no provider is active yet: ccp use NAME)"; fi
 }
 
 cmd_add() {
@@ -195,7 +222,7 @@ cmd_add() {
              case "$2" in *=*) SETS="$SETS$2"$'\n' ;; *) die "add: --set needs VAR=value" ;; esac; shift 2 ;;
       -f|--force) force=1; shift ;;
       -y|--yes) yes=1; shift ;;
-      --default) mkdef=1; shift ;;
+      --default|--use) mkdef=1; shift ;;
       --keep) keep=1; shift ;;
       -*) die "add: unknown option $1" ;;
       *) if [ -z "$name" ]; then name="$1"; else die "add: unexpected argument $1"; fi; shift ;;
@@ -299,8 +326,8 @@ EOF
   } > "$tmp"
   mv "$tmp" "$out" && chmod 600 "$out"
   note "created $out"
-  if [ "$mkdef" = 0 ] && [ "$interactive" = 1 ] && confirm "Make '$name' the default provider?"; then mkdef=1; fi
-  if [ "$mkdef" = 1 ]; then echo "$name" > "$DIR/default"; note "default provider is now $name"; fi
+  if [ "$mkdef" = 0 ] && [ "$interactive" = 1 ] && confirm "Switch claude to '$name' now?"; then mkdef=1; fi
+  if [ "$mkdef" = 1 ]; then cmd_use "$name"; fi
   return 0
 }
 
@@ -324,6 +351,11 @@ cmd_remove() {
     is_tty || die "remove: pass --yes to confirm"
     confirm "Delete provider '$n'${services:+ and its Keychain items}?" || { note "cancelled"; return 0; }
   fi
+  if [ "$(active_provider)" = "$n" ]; then
+    settings_clear
+    rm -f "$DIR/default" "$APPLIED"
+    note "$n was the active provider; Claude Code is back to its own sign-in"
+  fi
   if [ -n "$services" ]; then
     while IFS= read -r svc; do
       [ -n "$svc" ] || continue
@@ -333,7 +365,6 @@ $services
 EOF
   fi
   rm -f "$f"
-  if [ -f "$DIR/default" ] && [ "$(head -n1 "$DIR/default")" = "$n" ]; then rm -f "$DIR/default"; note "removed default setting (falls back to vertex)"; fi
   note "removed $n"
 }
 
@@ -368,14 +399,6 @@ EOF
   return 0
 }
 
-cmd_default() {
-  local n="${1:-}"
-  [ -n "$n" ] || die "usage: ccp default NAME"
-  [ -f "$DIR/$n.env" ] || die "no provider '$n' (see: ccp list)"
-  echo "$n" > "$DIR/default"
-  echo "default provider is now $n"
-}
-
 # ---- loading a provider's environment ---------------------------------------
 managed_vars() {
   {
@@ -390,15 +413,21 @@ managed_vars() {
       CLAUDE_CODE_SKIP_FOUNDRY_AUTH CLOUD_ML_REGION AWS_BEARER_TOKEN_BEDROCK AWS_PROFILE AWS_REGION
     env | sed -n 's/^\(VERTEX_REGION_CLAUDE_[A-Za-z0-9_]*\)=.*/\1/p'
     cat "$DIR"/*.env 2>/dev/null | sed -n 's/^[[:space:]]*export[[:space:]][[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'
-  } | grep -Ev '^(PATH|HOME|USER|LOGNAME|SHELL|TERM|PWD|OLDPWD|TMPDIR|LANG|LC_[A-Z_]+|SHLVL|_|CLAUDE_PROVIDERS_DIR|CLAUDE_PROVIDER|CCP_[A-Z_]+)$' | sort -u
+  } | grep -Ev '^(PATH|HOME|USER|LOGNAME|SHELL|TERM|PWD|OLDPWD|TMPDIR|LANG|LC_[A-Z_]+|SHLVL|_|CLAUDE_PROVIDERS_DIR|CLAUDE_PROVIDER|CLAUDE_CONFIG_DIR|CCP_[A-Z_]+)$' | sort -u
+}
+MANAGED=""
+is_managed() {
+  [ -n "$MANAGED" ] || MANAGED=" $(managed_vars | tr '\n' ' ') "
+  case "$MANAGED" in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
 
-load_provider() {
+# Clean slate, then source the provider file. Quiet: no network checks, no cloud checks.
+source_provider() {
   provider="$1"
   file="$DIR/$provider.env"
   [ -f "$file" ] || die "unknown provider '$provider' (have: $(list_providers | tr '\n' ' '); create one with: ccp add)"
-  local v p adc s
-  # Clean slate: anything any provider (or Claude Code) uses is cleared first, so nothing leaks between providers.
+  local v
+  # Anything any provider (or Claude Code) uses is cleared first, so nothing leaks between providers.
   for v in $(managed_vars); do unset "$v"; done
   unset -f ccp_check 2>/dev/null
   if needs_setup "$file"; then die "$file still has CHANGE_ME placeholders — edit it first (ccp edit $provider)"; fi
@@ -406,6 +435,12 @@ load_provider() {
   # shellcheck disable=SC1090
   . "$file" || { set +a; die "couldn't load $file"; }
   set +a
+}
+
+# source_provider plus the checks that need the network or cloud tools; sets SUMMARY.
+load_provider() {
+  source_provider "$1"
+  local p adc s
 
   if [ "${CLAUDE_CODE_USE_VERTEX:-}" = 1 ]; then
     if [ -z "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ] && command -v gcloud >/dev/null 2>&1; then
@@ -424,10 +459,10 @@ load_provider() {
   fi
   if declare -F ccp_check >/dev/null 2>&1; then ccp_check; fi
 
-  for s in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json" \
-           "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+  for s in "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+    [ "$PWD" != "$HOME" ] || continue   # in $HOME those are the user files, not a project's
     if [ -f "$s" ] && grep -qE '"(ANTHROPIC_[A-Z_]+|CLAUDE_CODE_USE_[A-Z]+|CLOUD_ML_REGION|AWS_PROFILE|AWS_REGION)"' "$s"; then
-      warn "$s sets provider variables that override ccp — remove them from its \"env\" block (see: ccp doctor)"
+      warn "$s sets provider variables for this project; they apply over the provider you pick"
     fi
   done
 
@@ -439,6 +474,9 @@ load_provider() {
   if [ -n "${ANTHROPIC_MODEL:-}" ]; then SUMMARY="$SUMMARY model=$ANTHROPIC_MODEL"; fi
 }
 
+# The token Claude Code should send, from the loaded provider. Empty when it has none.
+provider_token() { printf '%s' "${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}"; }
+
 show_env() {
   local v
   for v in $(managed_vars); do
@@ -446,20 +484,31 @@ show_env() {
   done | sed -E 's/^([A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)=.*/\1=***/'
 }
 
-cmd_show() { load_provider "${1:-$(default_provider)}"; echo "ccp: $SUMMARY"; show_env; }
+need_name() {
+  local n="${1:-}"
+  if [ -z "$n" ]; then n="$(default_provider)"; fi
+  [ -n "$n" ] || die "no provider is active yet. Pick one with: ccp use NAME   (see: ccp list)"
+  printf '%s' "$n"
+}
+
+cmd_show() { local n; n="$(need_name "${1:-}")" || exit 1; load_provider "$n"; echo "ccp: $SUMMARY"; show_env; }
 
 cmd_test() {
-  local n="${1:-$(default_provider)}" out rc
+  local n out rc ovr
+  n="$(need_name "${1:-}")" || exit 1
   load_provider "$n"
   command -v claude >/dev/null 2>&1 || die "'claude' not found on PATH"
   note "testing $SUMMARY ..."
+  export CCP_PROVIDER="$n"
+  ovr="$(launch_overrides)"
   run_start "$n"
   if command -v perl >/dev/null 2>&1; then
-    out="$(perl -e 'alarm 120; exec @ARGV' claude -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
+    out="$(perl -e 'alarm 120; exec @ARGV' claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
   else
-    out="$(claude -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
+    out="$(claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
   fi
   run_end "$rc"
+  [ -n "$ovr" ] && rm -f "$ovr"
   if [ "$rc" = 0 ] && [ -n "$out" ]; then
     echo "OK  $n works. Reply: $(printf '%s' "$out" | head -n1)"
     return 0
@@ -469,6 +518,316 @@ cmd_test() {
   return 1
 }
 
+# ---- Claude Code's settings file ------------------------------------------------
+# One perl program handles the JSON. Modes (CCP_MODE):
+#   read      print "env<TAB>KEY<TAB>value" for every env entry, then "helper<TAB>value"
+#   write     apply ops from stdin to the file (backup first):  del KEY | set KEY value | helper CMD | delhelper
+#   json      build a settings document from the same ops and print it (used for one-off launches)
+# Values on the wire are escaped with esc(): \t \n \\.
+SETTINGS_PL=""
+read -r -d '' SETTINGS_PL <<'PERL' || true
+use strict; use warnings; use JSON::PP;
+my $file = $ENV{CCP_FILE}; my $mode = $ENV{CCP_MODE};
+my $json = JSON::PP->new->utf8->canonical->pretty->indent_length(2);
+sub unesc { my $s = shift; $s =~ s/\\(.)/$1 eq 'n' ? "\n" : $1 eq 't' ? "\t" : $1/ge; return $s; }
+sub esc { my $s = shift; $s =~ s/\\/\\\\/g; $s =~ s/\n/\\n/g; $s =~ s/\t/\\t/g; return $s; }
+my $d = {}; my $txt = '';
+if ($mode ne 'json' && -e $file) {
+  open(my $fh, '<:raw', $file) or die "ccp: cannot read $file: $!\n";
+  $txt = do { local $/; <$fh> }; close $fh;
+  if ($txt =~ /\S/) {
+    $d = eval { $json->decode($txt) };
+    die "ccp: $file is not valid JSON. Fix it (a copy may be at $file.ccp-backup) before switching providers.\n"
+      unless $d && ref $d eq 'HASH';
+  }
+}
+if ($mode eq 'read') {
+  my $env = $d->{env};
+  if (ref $env eq 'HASH') {
+    for my $k (sort keys %$env) { my $v = $env->{$k}; $v = '' unless defined $v; print "env\t$k\t" . esc("$v") . "\n"; }
+  }
+  my $h = $d->{apiKeyHelper}; $h = '' unless defined $h && !ref $h;
+  print "helper\t" . esc("$h") . "\n";
+  exit 0;
+}
+my $env = (ref $d->{env} eq 'HASH') ? $d->{env} : {};
+my $changed = 0;
+while (my $l = <STDIN>) {
+  chomp $l; next unless length $l;
+  my ($op, $k, $v) = split /\t/, $l, 3;
+  $k = '' unless defined $k; $v = '' unless defined $v;
+  if ($op eq 'del') { if (exists $env->{$k}) { delete $env->{$k}; $changed++; } }
+  elsif ($op eq 'set') { $v = unesc($v); if (!exists $env->{$k} || !defined $env->{$k} || $env->{$k} ne $v) { $env->{$k} = $v; $changed++; } }
+  elsif ($op eq 'helper') { $k = unesc($k); if (!defined $d->{apiKeyHelper} || $d->{apiKeyHelper} ne $k) { $d->{apiKeyHelper} = $k; $changed++; } }
+  elsif ($op eq 'delhelper') {
+    if (defined $d->{apiKeyHelper} && !ref $d->{apiKeyHelper} && $d->{apiKeyHelper} =~ /(^|[\/ ])ccp auth$/) { delete $d->{apiKeyHelper}; $changed++; }
+  }
+}
+if (%$env) { $d->{env} = $env; } else { delete $d->{env}; }
+if ($mode eq 'json') { print $json->encode($d); exit 0; }
+if (!$changed && -e $file) { print "unchanged\t$file\n"; exit 0; }
+my $dir = $file; $dir =~ s{/[^/]*$}{}; $dir = '.' if $dir eq '';
+if (-e $file) {
+  my $orig = "$file.ccp-original"; my $bak = "$file.ccp-backup";
+  for my $b ($orig, $bak) {
+    next if $b eq $orig && -e $orig;
+    open(my $o, '>:raw', $b) or die "ccp: cannot write backup $b: $!\n"; print $o $txt; close $o; chmod 0600, $b;
+  }
+  print "backup\t$bak\n";
+}
+my $tmp = "$file.ccp-tmp.$$";
+open(my $w, '>:raw', $tmp) or die "ccp: cannot write $tmp: $!\n";
+print $w $json->encode($d); close $w;
+my $mode_bits = (-e $file) ? ((stat $file)[2] & 07777) : 0600;
+chmod $mode_bits, $tmp;
+rename $tmp, $file or die "ccp: cannot replace $file: $!\n";
+print "written\t$file\n";
+PERL
+
+settings_read()  { CCP_FILE="$SETTINGS" CCP_MODE=read perl -e "$SETTINGS_PL"; }
+settings_write() { mkdir -p "$CLAUDE_DIR" 2>/dev/null; CCP_FILE="$SETTINGS" CCP_MODE=write perl -e "$SETTINGS_PL"; }
+settings_json()  { CCP_FILE="$SETTINGS" CCP_MODE=json perl -e "$SETTINGS_PL"; }
+
+# Provider variables currently in the settings file, as "KEY<TAB>escaped value" lines.
+settings_managed() {
+  local kind k v
+  settings_read 2>/dev/null | while IFS=$'\t' read -r kind k v; do
+    if [ "$kind" = env ] && is_managed "$k"; then printf '%s\t%s\n' "$k" "$v"; fi
+  done
+}
+settings_helper() { settings_read 2>/dev/null | sed -n 's/^helper\t//p' | head -n1; }
+is_our_helper() { case "$1" in *"ccp auth") return 0 ;; *) return 1 ;; esac; }
+
+helper_command() {
+  local me
+  me="$(self_path)"; [ -n "$me" ] || die "can't work out where ccp lives"
+  printf '%s auth' "$(printf '%q' "$me")"
+}
+
+# Remove everything ccp put into the settings file.
+settings_clear() {
+  local v ops=""
+  for v in $(managed_vars); do ops="${ops}del"$'\t'"$v"$'\n'; done
+  ops="${ops}delhelper"$'\n'
+  printf '%s' "$ops" | settings_write >/dev/null
+}
+
+# The ops that make the settings file match the loaded provider (also recorded in $APPLIED).
+provider_ops() {
+  local v ops="" token
+  for v in $(managed_vars); do ops="${ops}del"$'\t'"$v"$'\n'; done
+  token="$(provider_token)"
+  for v in $(managed_vars); do
+    [ -n "${!v+x}" ] || continue
+    case "$v" in ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY) continue ;; esac
+    ops="${ops}set"$'\t'"$v"$'\t'"$(esc "${!v}")"$'\n'
+  done
+  if [ -n "$token" ]; then ops="${ops}helper"$'\t'"$(esc "$(helper_command)")"$'\n'
+  else ops="${ops}delhelper"$'\n'; fi
+  printf '%s' "$ops"
+}
+
+cmd_use() {
+  local n="${1:-}" v ops out
+  [ -n "$n" ] || die "usage: ccp use NAME   (or: ccp use none)"
+  if [ "$n" = none ] || [ "$n" = off ]; then
+    command -v perl >/dev/null 2>&1 || die "perl is needed to edit $SETTINGS"
+    settings_clear
+    rm -f "$DIR/default" "$APPLIED"
+    echo "ccp: no provider is active. Claude Code uses its own sign-in and settings again."
+    return 0
+  fi
+  [ -f "$DIR/$n.env" ] || die "no provider '$n' (see: ccp list)"
+  command -v perl >/dev/null 2>&1 || die "perl is needed to edit $SETTINGS"
+  load_provider "$n"
+  for v in $(managed_vars); do
+    [ -n "${!v+x}" ] || continue
+    case "$v" in ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY) continue ;; esac
+    if is_secret_name "$v" && [ -n "${!v}" ]; then
+      warn "$v is written to $SETTINGS in plain text; Claude Code has no other way to receive it"
+    fi
+  done
+  ops="$(provider_ops)"
+  out="$(printf '%s' "$ops" | settings_write)" || exit 1
+  umask 077
+  { echo "provider"$'\t'"$n"; printf '%s' "$ops" | grep -E '^(set|helper)'$'\t' || true; } > "$APPLIED"
+  echo "$n" > "$DIR/default"
+  echo "ccp: claude now uses $SUMMARY"
+  case "$out" in *backup*) echo "ccp: updated $SETTINGS (previous copy: $SETTINGS.ccp-backup)" ;; esac
+  echo "ccp: this applies to every new Claude Code session: Terminal, iTerm, VS Code, and other editors. Sessions already running keep their old provider."
+}
+
+# ---- the apiKeyHelper Claude Code calls ----------------------------------------------
+cmd_auth() {
+  local n tok
+  n="${CCP_PROVIDER:-$(active_provider)}"
+  [ -n "$n" ] || { echo "ccp auth: no provider is active (ccp use NAME)" >&2; exit 1; }
+  source_provider "$n" 2>/dev/null
+  tok="$(provider_token)"
+  [ -n "$tok" ] || { echo "ccp auth: $n has no API key or token" >&2; exit 1; }
+  printf '%s' "$tok"
+}
+
+# ---- state: does Claude Code's settings file still say what ccp wrote? -------------------
+# Sets STATE (synced|drift|stale|foreign|unset) and DIFF_KEYS (space separated).
+compute_state() {
+  local active cur exp curh exph k v ck cv found
+  STATE=unset; DIFF_KEYS=""
+  active="$(active_provider)"
+  cur="$(settings_managed)"
+  curh="$(settings_helper)"
+  is_our_helper "$curh" || curh=""
+  if [ -f "$APPLIED" ]; then
+    exp="$(sed -n 's/^set\t//p' "$APPLIED")"
+    exph="$(sed -n 's/^helper\t//p' "$APPLIED" | head -n1)"
+    if [ "$(printf '%s' "$cur" | sort)" = "$(printf '%s' "$exp" | sort)" ] && [ "$curh" = "$exph" ]; then
+      STATE=synced
+    else
+      STATE=drift
+      while IFS=$'\t' read -r k v; do
+        [ -n "$k" ] || continue
+        found=0
+        while IFS=$'\t' read -r ck cv; do
+          if [ "$ck" = "$k" ] && [ "$cv" = "$v" ]; then found=1; break; fi
+        done <<EOF
+$exp
+EOF
+        [ "$found" = 1 ] || DIFF_KEYS="$DIFF_KEYS $k"
+      done <<EOF
+$cur
+EOF
+      while IFS=$'\t' read -r k v; do
+        [ -n "$k" ] || continue
+        found=0
+        while IFS=$'\t' read -r ck cv; do
+          if [ "$ck" = "$k" ]; then found=1; break; fi
+        done <<EOF
+$cur
+EOF
+        [ "$found" = 1 ] || DIFF_KEYS="$DIFF_KEYS $k"
+      done <<EOF
+$exp
+EOF
+      if [ "$curh" != "$exph" ]; then DIFF_KEYS="$DIFF_KEYS apiKeyHelper"; fi
+    fi
+  elif [ -n "$active" ]; then
+    STATE=stale
+    while IFS=$'\t' read -r k v; do [ -n "$k" ] && DIFF_KEYS="$DIFF_KEYS $k"; done <<EOF
+$cur
+EOF
+  elif [ -n "$cur" ] || [ -n "$curh" ]; then
+    STATE=foreign
+    while IFS=$'\t' read -r k v; do [ -n "$k" ] && DIFF_KEYS="$DIFF_KEYS $k"; done <<EOF
+$cur
+EOF
+  fi
+  DIFF_KEYS="$(trim "$DIFF_KEYS")"
+}
+
+cmd_status() {
+  local plain=0 active k c hook="missing"
+  [ "${1:-}" = "--plain" ] && plain=1
+  command -v perl >/dev/null 2>&1 || die "perl is needed to read $SETTINGS"
+  active="$(active_provider)"
+  compute_state
+  if hook_in "$(rc_files | head -n1)"; then hook=installed; fi
+  c="$(command -v claude 2>/dev/null || true)"
+  if [ "$plain" = 1 ]; then
+    printf 'active\t%s\n' "$active"
+    printf 'state\t%s\n' "$STATE"
+    printf 'settings\t%s\n' "$SETTINGS"
+    for k in $DIFF_KEYS; do printf 'key\t%s\n' "$k"; done
+    printf 'helper\t%s\n' "$(is_our_helper "$(settings_helper)" && echo on || echo off)"
+    printf 'hook\t%s\n' "$hook"
+    printf 'claude\t%s\n' "$c"
+    return 0
+  fi
+  case "$STATE" in
+    synced)  echo "claude uses $active (settings in $SETTINGS match)" ;;
+    drift)   echo "claude was switched to $active, but $SETTINGS has changed since: $DIFF_KEYS"
+             echo "  re-apply with: ccp use $active" ;;
+    stale)   echo "$active is chosen but hasn't been applied to Claude Code yet: ccp use $active"
+             [ -n "$DIFF_KEYS" ] && echo "  until then $SETTINGS decides, with: $DIFF_KEYS" ;;
+    foreign) echo "no provider is active; $SETTINGS sets provider variables by hand: $DIFF_KEYS"
+             echo "  keep them as a provider with: ccp import NAME    then: ccp use NAME" ;;
+    unset)   echo "no provider is active; Claude Code uses its own sign-in" ;;
+  esac
+  if [ "$hook" = installed ]; then echo "plain claude launches are recorded for Usage (shell hook on)"; fi
+}
+
+# ---- keep the settings someone typed by hand, as a provider --------------------------
+cmd_import() {
+  local name="" force=0 a k v kind="custom" lines="" headers="" svc n=0 raw
+  for a in "$@"; do case "$a" in -f|--force) force=1 ;; -*) die "import: unknown option $a" ;; *) name="$a" ;; esac; done
+  [ -n "$name" ] || die "usage: ccp import NAME [--force]"
+  valid_name "$name" || die "import: invalid name '$name' (letters, digits, - and _; not a ccp command word)"
+  command -v perl >/dev/null 2>&1 || die "perl is needed to read $SETTINGS"
+  local out="$DIR/$name.env"
+  if [ -e "$out" ] && [ "$force" = 0 ]; then die "import: '$name' already exists (replace with --force)"; fi
+  local cur; cur="$(settings_managed)"
+  [ -n "$cur" ] || die "import: $SETTINGS has no provider variables to import"
+  while IFS=$'\t' read -r k v; do
+    [ -n "$k" ] || continue
+    raw="$(printf '%b' "${v//%/%%}")"
+    case "$k" in
+      CLAUDE_CODE_USE_BEDROCK) [ "$raw" = 1 ] && kind=bedrock ;;
+      CLAUDE_CODE_USE_VERTEX)  [ "$raw" = 1 ] && kind=vertex ;;
+      CLAUDE_CODE_USE_FOUNDRY) [ "$raw" = 1 ] && kind=foundry ;;
+      ANTHROPIC_BASE_URL) if [ "$kind" = custom ]; then case "$raw" in *litellm*|*:4000*) kind=litellm ;; *) kind=gateway ;; esac; fi ;;
+      ANTHROPIC_API_KEY) [ "$kind" = custom ] && kind=anthropic ;;
+    esac
+    if is_secret_name "$k" && [ -n "$raw" ] && have_security; then
+      svc="ccp-$name-$k"
+      kc_set "$svc" "$raw" || die "import: couldn't store $k in the Keychain"
+      headers="$headers# secret-service: $svc"$'\n'
+      lines="${lines}export $k=\"\$(ccp_secret $svc)\""$'\n'
+    else
+      lines="${lines}export $k=$(printf '%q' "$raw")"$'\n'
+    fi
+    n=$((n+1))
+  done <<EOF
+$cur
+EOF
+  umask 077
+  mkdir -p "$DIR"
+  {
+    echo "# description: Imported from Claude Code's settings on $(date '+%Y-%m-%d')"
+    echo "# template: custom"
+    echo "# kind: $kind"
+    printf '%s' "$headers"
+    echo
+    printf '%s' "$lines"
+  } > "$out"
+  chmod 600 "$out"
+  note "created $out with $n variable(s)${headers:+; secrets moved to the Keychain}"
+  echo "ccp: switch to it with: ccp use $name"
+}
+
+# A settings document for one launch, so this session beats whatever is in the settings file.
+# Prints the path of a temp file, or nothing when the file needs no overriding.
+launch_overrides() {
+  local k v ops="" need=0 h tmp
+  command -v perl >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r k v; do
+    [ -n "$k" ] || continue
+    if [ -n "${!k+x}" ]; then
+      if [ "$(esc "${!k}")" != "$v" ]; then need=1; fi
+      ops="${ops}set"$'\t'"$k"$'\t'"$(esc "${!k}")"$'\n'
+    else
+      need=1
+      ops="${ops}set"$'\t'"$k"$'\t'$'\n'
+    fi
+  done <<EOF
+$(settings_managed)
+EOF
+  h="$(settings_helper)"
+  if [ -n "$h" ] && [ -z "$(provider_token)" ]; then need=1; ops="${ops}helper"$'\t'$'\n'; fi
+  [ "$need" = 1 ] || return 0
+  umask 077
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ccp-settings.XXXXXX")" || return 0
+  printf '%s' "$ops" | settings_json > "$tmp" || { rm -f "$tmp"; return 0; }
+  printf '%s' "$tmp"
+}
 
 # ---- usage log ----------------------------------------------------------------
 RUNLOG="$DIR/usage/runs.log"
@@ -484,7 +843,7 @@ run_end() {
   printf 'E\t%s\t%s\t%s\n' "$(date +%s)" "$$" "${1:-0}" >>"$RUNLOG" 2>/dev/null
 }
 
-# ---- plain `claude` follows the default provider ----------------------------------
+# ---- optional shell hook: plain `claude` runs through ccp so launches are recorded ------------
 RC_BEGIN='# >>> ccp (Claude provider switcher) >>>'
 RC_END='# <<< ccp <<<'
 rc_files() {
@@ -521,8 +880,8 @@ cmd_shell() {
         {
           [ -s "$tmp" ] && echo
           echo "$RC_BEGIN"
-          echo '# Plain `claude` uses the provider chosen in Switchboard (or: ccp default NAME).'
-          echo '# One-off: CLAUDE_PROVIDER=NAME claude   |   skip ccp: command claude'
+          echo '# Plain `claude` runs through ccp so Switchboard can record which provider each session used.'
+          echo '# Skip it once with: command claude'
           printf 'claude() {\n  if [ -x %q ]; then %q run "$@"; else command claude "$@"; fi\n}\n' "$me" "$me"
           echo "$RC_END"
         } >> "$tmp"
@@ -548,38 +907,24 @@ cmd_shell() {
   esac
 }
 
-# ---- provider variables hiding in Claude Code's own settings ------------------------
+# ---- provider variables in the settings file that ccp didn't put there ------------------------
 cmd_overrides() {
-  local fix=0 f keys
+  local fix=0 k ops=""
   if [ "${1:-}" = "--fix" ]; then fix=1; fi
   command -v perl >/dev/null 2>&1 || die "perl is needed for this"
-  keys="$(managed_vars)"
-  for f in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json"; do
-    [ -f "$f" ] || continue
-    printf '%s\n' "$keys" | CCP_FILE="$f" CCP_FIX="$fix" perl -MJSON::PP -MPOSIX -e '
-      my $file = $ENV{CCP_FILE}; my $fix = $ENV{CCP_FIX};
-      my %k; while (my $l = <STDIN>) { chomp $l; $k{$l} = 1 if length $l; }
-      open(my $fh, "<:raw", $file) or die "ccp: cannot read $file: $!\n";
-      my $txt = do { local $/; <$fh> }; close $fh;
-      my $json = JSON::PP->new->utf8->canonical->pretty->indent_length(2);
-      my $d = eval { $json->decode($txt) };
-      if (!$d || ref $d ne "HASH") { print STDERR "ccp: $file is not plain JSON, skipped\n"; exit 0; }
-      my $env = $d->{env};
-      exit 0 unless ref $env eq "HASH";
-      my @hit = sort grep { $k{$_} } keys %$env;
-      exit 0 unless @hit;
-      if (!$fix) { print "$file\t$_\n" for @hit; exit 0; }
-      my $backup = "$file.ccp-backup-" . POSIX::strftime("%Y%m%d%H%M%S", localtime);
-      open(my $o, ">:raw", $backup) or die "ccp: cannot write backup $backup: $!\n";
-      print $o $txt; close $o; chmod 0600, $backup;
-      delete $env->{$_} for @hit;
-      delete $d->{env} unless %$env;
-      open(my $w, ">:raw", $file) or die "ccp: cannot write $file: $!\n";
-      print $w $json->encode($d); close $w;
-      print "backup\t$backup\n";
-      print "removed\t$file\t$_\n" for @hit;
-    ' || return 1
+  compute_state
+  case "$STATE" in drift|foreign) ;; *) return 0 ;; esac
+  for k in $DIFF_KEYS; do
+    [ "$k" = apiKeyHelper ] && continue
+    if [ "$fix" = 0 ]; then printf '%s\t%s\n' "$SETTINGS" "$k"; else ops="${ops}del"$'\t'"$k"$'\n'; fi
   done
+  if [ "$fix" = 1 ] && [ -n "$ops" ]; then
+    printf '%s' "$ops" | settings_write | sed -n 's/^backup\t/backup\t/p'
+    for k in $DIFF_KEYS; do [ "$k" = apiKeyHelper ] || printf 'removed\t%s\t%s\n' "$SETTINGS" "$k"; done
+    # Put back what the active provider needs, so a fix never leaves it half applied.
+    local active; active="$(active_provider)"
+    if [ -n "$active" ] && [ -f "$APPLIED" ]; then grep -E '^(set|helper)'$'\t' "$APPLIED" | settings_write >/dev/null; fi
+  fi
   return 0
 }
 
@@ -594,20 +939,37 @@ cmd_doctor() {
   echo "claude"
   if c="$(command -v claude)"; then d_ok "$c ($(claude --version 2>/dev/null | head -n1))"; else d_bad "'claude' not found on PATH"; fi
   if command -v ccp >/dev/null 2>&1; then d_ok "ccp is on PATH ($(command -v ccp))"; else d_warn "ccp isn't on PATH — add to ~/.zshrc:  export PATH=\"\$HOME/bin:\$PATH\""; fi
+  command -v perl >/dev/null 2>&1 || d_bad "perl not found; ccp needs it to edit $SETTINGS"
 
-  if hook_in "$(rc_files | head -n1)"; then d_ok "plain 'claude' follows your default provider (shell hook installed)"
-  else d_warn "plain 'claude' ignores ccp — turn on the shell hook:  ccp shell install"; fi
+  echo "active provider"
+  cur="$(active_provider)"
+  if command -v perl >/dev/null 2>&1; then
+    compute_state
+    case "$STATE" in
+      synced)  d_ok "claude uses $cur; $SETTINGS matches" ;;
+      drift)   d_bad "$SETTINGS changed since you switched to $cur ($DIFF_KEYS) — re-apply: ccp use $cur" ;;
+      stale)   d_bad "$cur is chosen but not applied to Claude Code — run: ccp use $cur" ;;
+      foreign) d_bad "$SETTINGS sets provider variables by hand ($DIFF_KEYS); they decide what claude uses — keep them: ccp import NAME, then switch: ccp use NAME" ;;
+      unset)   d_warn "no provider is active; claude uses its own sign-in — pick one: ccp use NAME" ;;
+    esac
+    if [ "$STATE" = synced ] && [ -f "$APPLIED" ] && grep -q '^helper'$'\t' "$APPLIED"; then
+      if CCP_PROVIDER="$cur" "$(self_path)" auth >/dev/null 2>&1; then d_ok "Claude Code can fetch the key for $cur from the Keychain (ccp auth)"
+      else d_bad "ccp auth can't produce a key for $cur — check its Keychain item: ccp key $cur"; fi
+    fi
+  fi
+  if [ -n "$cur" ] && [ ! -f "$DIR/$cur.env" ]; then d_bad "active provider '$cur' doesn't exist (ccp use NAME)"; fi
+  if hook_in "$(rc_files | head -n1)"; then d_ok "plain claude launches are recorded for Usage (shell hook on)"
+  else d_ok "plain claude isn't recorded for Usage (optional: ccp shell install)"; fi
 
   echo "providers ($DIR)"
-  cur="$(default_provider)"
   if [ -z "$(list_providers)" ]; then d_warn "none yet — run: ccp add"; fi
   for p in $(list_providers); do
     f="$DIR/$p.env"
-    if [ "$p" = "$cur" ]; then d_ok "$p (default)"; else d_ok "$p"; fi
+    if [ "$p" = "$cur" ]; then d_ok "$p (active)"; else d_ok "$p"; fi
     if needs_setup "$f"; then d_warn "$p still has CHANGE_ME placeholders (ccp edit $p)"; fi
     perm="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
     case "$perm" in *00) ;; *) d_warn "$p.env is readable by others (mode $perm) — chmod 600 $f" ;; esac
-    if grep -E '^[[:space:]]*export[[:space:]]+[A-Za-z0-9_]*(KEY|TOKEN|SECRET)[A-Za-z0-9_]*=' "$f" | grep -v ccp_secret | grep -v CHANGE_ME | grep -vqE "=(''|\"\"|)[[:space:]]*(#.*)?$"; then
+    if grep -E '^[[:space:]]*export[[:space:]]+[A-Za-z0-9_]*(KEY|TOKEN|SECRET)[A-Za-z0-9_]*=' "$f" | grep -v ccp_secret | grep -v CHANGE_ME | grep -vqE "=(''|\"\")?[[:space:]]*(#.*)?$"; then
       d_warn "$p.env holds a plaintext secret — move it to the Keychain: ccp add $p --force"
     fi
     while IFS= read -r svc; do
@@ -617,26 +979,26 @@ cmd_doctor() {
 $(secret_services "$f")
 EOF
   done
-  if [ -n "$cur" ] && [ ! -f "$DIR/$cur.env" ]; then d_bad "default provider '$cur' doesn't exist (ccp default NAME)"; fi
 
-  echo "things that could override ccp"
+  echo "things that could override your choice"
   hits=0
   for s in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
     if [ -f "$s" ]; then
       while IFS= read -r p; do
         [ -n "$p" ] || continue
-        d_warn "$s:$p — ccp clears it for sessions it starts, but a plain 'claude' still gets it"; hits=1
+        d_warn "$s:$p — exported in your shell; Claude Code reads it when the settings file doesn't set the same variable"; hits=1
       done <<EOF
 $(grep -nE '^[[:space:]]*export[[:space:]]+(ANTHROPIC_|CLAUDE_CODE_USE_|CLOUD_ML_REGION)' "$s" | sed 's/=.*//')
 EOF
     fi
   done
-  for s in "$HOME/.claude/settings.json" "$HOME/.claude/settings.local.json" "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+  for s in "$CLAUDE_DIR/settings.local.json" "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+    if [ "$PWD" = "$HOME" ]; then case "$s" in "$PWD/"*) continue ;; esac; fi   # in $HOME those are the user files
     if [ -f "$s" ] && grep -qE '"(ANTHROPIC_[A-Z_]+|CLAUDE_CODE_USE_[A-Z]+|CLOUD_ML_REGION|AWS_PROFILE|AWS_REGION)"' "$s"; then
-      d_bad "$s sets provider variables in its \"env\" block; Claude Code applies them over ccp. Remove those keys."; hits=1
+      d_bad "$s sets provider variables in its \"env\" block; Claude Code applies them over the active provider. Remove those keys."; hits=1
     fi
   done
-  if [ "$hits" = 0 ]; then d_ok "no overrides found in shell profiles or Claude settings"; fi
+  if [ "$hits" = 0 ]; then d_ok "no overrides found in shell profiles or project settings"; fi
   [ "$D_BAD" = 0 ]
 }
 
@@ -646,9 +1008,9 @@ case "$sub" in
   --version) echo "ccp $CCP_VERSION"; exit 0 ;;
   help|-h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   -l|--list)
-    cur="$(default_provider)"
+    cur="$(active_provider)"
     for p in $(list_providers); do
-      if [ "$p" = "$cur" ]; then echo "* $p (default)"; else echo "  $p"; fi
+      if [ "$p" = "$cur" ]; then echo "* $p (active)"; else echo "  $p"; fi
     done
     exit 0 ;;
   list|ls) cmd_list; exit $? ;;
@@ -661,15 +1023,18 @@ case "$sub" in
     secret_services "$DIR/$2.env" | while IFS= read -r svc; do [ -n "$svc" ] && echo "${svc#ccp-$2-}"; done
     exit 0 ;;
   add|new) shift; cmd_add "$@"; exit $? ;;
+  import) shift; cmd_import "$@"; exit $? ;;
   edit) shift; cmd_edit "$@"; exit $? ;;
   remove|rm) shift; cmd_remove "$@"; exit $? ;;
   key) shift; cmd_key "$@"; exit $? ;;
   show) cmd_show "${2:-}"; exit $? ;;
   test) cmd_test "${2:-}"; exit $? ;;
   doctor) cmd_doctor; exit $? ;;
+  status) cmd_status "${2:-}"; exit $? ;;
+  auth) cmd_auth; exit $? ;;
   shell) shift; cmd_shell "$@"; exit $? ;;
   overrides) shift; cmd_overrides "$@"; exit $? ;;
-  default|--default) shift; cmd_default "$@"; exit $? ;;
+  use|default|--default) shift; cmd_use "$@"; exit $? ;;
 esac
 
 provider=""
@@ -677,18 +1042,29 @@ if [ "$sub" = run ]; then
   shift
 elif [ -n "${1:-}" ] && [ -f "$DIR/$1.env" ]; then
   provider="$1"; shift
+elif [ -n "${1:-}" ] && [ "${1#-}" = "$1" ]; then
+  die "'$1' is neither a provider nor a command (see: ccp list, ccp help)"
 fi
 [ -n "$provider" ] || provider="$(default_provider)"
+[ -n "$provider" ] || die "no provider is active yet. Pick one with: ccp use NAME   (see: ccp list)"
 load_provider "$provider"
+export CCP_PROVIDER="$provider"
+OVR="$(launch_overrides)"
+cleanup() { [ -n "$OVR" ] && rm -f "$OVR"; }
 
-if [ -n "${CCP_DRY_RUN:-}" ]; then echo "ccp: $SUMMARY"; show_env; exit 0; fi
-command -v claude >/dev/null 2>&1 || die "'claude' not found on PATH"
+if [ -n "${CCP_DRY_RUN:-}" ]; then
+  echo "ccp: $SUMMARY"; show_env
+  if [ -n "$OVR" ]; then echo "ccp: settings overridden for this launch:"; sed -E 's/("[A-Za-z0-9_]*(KEY|TOKEN|SECRET)[A-Za-z0-9_]*" *: *")[^"]+/\1***/' "$OVR"; fi
+  cleanup; exit 0
+fi
+command -v claude >/dev/null 2>&1 || { cleanup; die "'claude' not found on PATH"; }
 echo "ccp: claude -> $SUMMARY" >&2
 run_start "$provider"
 trap ':' INT
-trap 'run_end 129; exit 129' HUP
-trap 'run_end 143; exit 143' TERM
-claude "$@"
+trap 'run_end 129; cleanup; exit 129' HUP
+trap 'run_end 143; cleanup; exit 143' TERM
+if [ -n "$OVR" ]; then claude --settings "$OVR" "$@"; else claude "$@"; fi
 rc=$?
 run_end "$rc"
+cleanup
 exit "$rc"

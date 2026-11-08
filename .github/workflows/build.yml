@@ -30,7 +30,20 @@ jobs:
           export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
           ./install.sh --no-app
           export PATH="$HOME/bin:$PATH"
+          export CLAUDE_CONFIG_DIR="$HOME/.claude"; mkdir -p "$CLAUDE_CONFIG_DIR"
+          echo '{"env":{"ANTHROPIC_BASE_URL":"https://gw.example.com","ANTHROPIC_MODEL":"demo-model"},"model":"opus"}' > "$CLAUDE_CONFIG_DIR/settings.json"
           ccp templates --plain
-          ccp add demo -t anthropic-login --yes --default
+          ccp status --plain | grep -q '^state	foreign'
+          ccp import corp
+          ccp add demo -t anthropic-login --yes --use
           ccp list
           ccp show demo
+          ccp status --plain | grep -q '^state	synced'
+          grep -q '"model" : "opus"' "$CLAUDE_CONFIG_DIR/settings.json"
+          ! grep -q ANTHROPIC_BASE_URL "$CLAUDE_CONFIG_DIR/settings.json"
+          ccp use corp
+          grep -q '"ANTHROPIC_MODEL" : "demo-model"' "$CLAUDE_CONFIG_DIR/settings.json"
+          CCP_DRY_RUN=1 ccp demo | grep -q '"ANTHROPIC_BASE_URL" : ""'
+          ccp use none
+          ccp status --plain | grep -q '^state	unset'
+          ccp doctor || true

@@ -1,64 +1,72 @@
 import SwiftUI
 import AppKit
 
-struct HookStatus {
-    var installed: Bool
-    var files: [String]
-}
-
-struct OverrideEntry: Identifiable {
-    var file: String
-    var keys: [String]
-    var id: String { file }
-}
-
-// MARK: - Plain `claude` in the terminal, and settings that fight it
+// MARK: - Switching: what Claude Code is set to, and the optional shell hook
 
 extension Store {
-    func refreshTerminal() async {
-        let s = await ccpRun(["shell", "status"], timeout: 20)
-        var installed = false
-        var files: [String] = []
-        for part in s.stdout.split(separator: "\n") {
-            let f = part.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-            guard f.count == 2 else { continue }
-            files.append(String(f[1]))
-            if f[0] == "installed" { installed = true }
+    /// Asks ccp which provider is active and whether Claude Code's settings file still matches it.
+    func refreshSwitch() async {
+        let r = await ccpRun(["status", "--plain"], timeout: 20)
+        if r.ok {
+            status = SwitchStatus.parse(r.stdout)
+        } else if status == nil {
+            status = SwitchStatus(active: "", state: .unset, settingsPath: dir, keys: [],
+                                  helperOn: false, hookInstalled: false, claudePath: "")
         }
-        hook = HookStatus(installed: installed, files: files)
+    }
 
-        let o = await ccpRun(["overrides"], timeout: 20)
-        var order: [String] = []
-        var map: [String: [String]] = [:]
-        for part in o.stdout.split(separator: "\n") {
-            let f = part.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-            guard f.count == 2 else { continue }
-            let file = String(f[0])
-            if map[file] == nil { order.append(file) }
-            map[file, default: []].append(String(f[1]))
+    /// Writes the active provider into Claude Code's settings again, after someone edited the file.
+    func reapply() async {
+        guard let name = status?.active, !name.isEmpty else { return }
+        await activate(name)
+    }
+
+    /// Takes ccp's variables out of Claude Code's settings. Claude Code goes back to its own sign-in.
+    func release() async {
+        switchBusy = true
+        let r = await ccpRun(["use", "none"], timeout: 30)
+        await refresh()
+        await refreshSwitch()
+        switchBusy = false
+        show(r.ok ? "Claude Code is back to its own sign-in." : Store.summarize(r), error: !r.ok)
+    }
+
+    /// Turns the provider variables someone typed into settings.json into a provider of their own.
+    /// Returns an error message on failure.
+    func importCurrent(as name: String) async -> String? {
+        switchBusy = true
+        let r = await ccpRun(["import", name], timeout: 30)
+        await refresh()
+        await refreshSwitch()
+        switchBusy = false
+        if r.ok {
+            selection = .provider(name)
+            show("Saved as \(name). Switch to it when you're ready.")
+            return nil
         }
-        overrides = order.map { OverrideEntry(file: $0, keys: map[$0] ?? []) }
+        return Store.summarize(r)
+    }
+
+    /// Removes provider variables that ccp didn't write from Claude Code's settings.
+    func removeOverrides() async {
+        switchBusy = true
+        let r = await ccpRun(["overrides", "--fix"], timeout: 30)
+        await refreshSwitch()
+        switchBusy = false
+        show(r.ok ? "Removed. A copy of the file was kept next to it." : Store.summarize(r), error: !r.ok)
     }
 
     func setHook(_ on: Bool) async {
-        terminalBusy = true
+        switchBusy = true
         let r = await ccpRun(["shell", on ? "install" : "remove"], timeout: 20)
-        await refreshTerminal()
-        terminalBusy = false
+        await refreshSwitch()
+        switchBusy = false
         if r.ok {
-            show(on ? "Done. Open a new Terminal window and claude will use your default provider."
-                    : "Removed. Plain claude uses your shell's own settings again.")
+            show(on ? "Done. From the next Terminal window on, claude launches show up in Usage."
+                    : "Removed. Plain claude runs without ccp again.")
         } else {
-            show(Store.summarize(r))
+            show(Store.summarize(r), error: true)
         }
-    }
-
-    func removeOverrides() async {
-        terminalBusy = true
-        let r = await ccpRun(["overrides", "--fix"], timeout: 30)
-        await refreshTerminal()
-        terminalBusy = false
-        show(r.ok ? "Removed. A backup is saved next to each file." : Store.summarize(r))
     }
 
     // MARK: - Usage

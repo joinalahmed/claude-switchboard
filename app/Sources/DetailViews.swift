@@ -40,6 +40,7 @@ struct HeroSection: View {
     }
 
     private var testing: Bool { store.testing.contains(provider.name) }
+    private var switching: Bool { store.switching == provider.name }
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -84,22 +85,33 @@ struct HeroSection: View {
                         HeroChip(text: k.vendor)
                     }
                     HeroChip(text: provider.status.label, symbol: provider.status.symbol)
-                    if provider.isDefault {
-                        HeroChip(text: "Default for claude", symbol: "star.fill")
+                    if provider.isActive {
+                        HeroChip(text: "claude uses this now", symbol: "checkmark.circle.fill")
                     }
                 }
                 hint
             }
             Spacer(minLength: 8)
             VStack(spacing: 9) {
+                if !provider.isActive {
+                    Button {
+                        Task { await store.activate(provider.name) }
+                    } label: {
+                        Label(switching ? "Switching…" : "Use for claude", systemImage: "arrow.triangle.swap")
+                    }
+                    .buttonStyle(HeroButtonStyle(filled: true, tint: accent.b))
+                    .disabled(provider.status != .ready || store.switching != nil)
+                    .help("Make every new Claude Code session use \(provider.name)")
+                }
                 Button {
                     store.launch(provider.name)
                 } label: {
                     Label("Launch", systemImage: "play.fill")
                 }
-                .buttonStyle(HeroButtonStyle(filled: true, tint: accent.b))
+                .buttonStyle(HeroButtonStyle(filled: provider.isActive, tint: accent.b))
                 .disabled(provider.needsSetup)
-                .help("Open Claude Code in Terminal with \(provider.name)")
+                .help(provider.isActive ? "Open Claude Code in Terminal with \(provider.name)"
+                                        : "One session with \(provider.name) in Terminal, without switching")
 
                 Button {
                     Task { await store.test(provider.name) }
@@ -383,7 +395,7 @@ struct SettingsSection: View {
         let secs = secrets
         Task {
             let err = await store.saveProvider(name: provider.name, template: t.name, values: vals,
-                                               secrets: secs, makeDefault: false, replace: true)
+                                               secrets: secs, activate: false, replace: true)
             saving = false
             if let err = err {
                 message = err
@@ -532,13 +544,13 @@ struct ManageSection: View {
         Section {
             HStack {
                 Button {
-                    Task { await store.setDefault(provider.name) }
+                    Task { await store.activate(provider.name) }
                 } label: {
-                    Label(provider.isDefault ? "Default for claude" : "Make default",
-                          systemImage: provider.isDefault ? "star.fill" : "star")
+                    Label(provider.isActive ? "claude uses this now" : "Use for claude",
+                          systemImage: provider.isActive ? "checkmark.circle.fill" : "arrow.triangle.swap")
                 }
-                .buttonStyle(SoftButtonStyle(color: Color.orange))
-                .disabled(provider.isDefault)
+                .buttonStyle(SoftButtonStyle(color: provider.isActive ? Color.green : provider.accent.a))
+                .disabled(provider.isActive || provider.status != .ready || store.switching != nil)
                 Spacer()
                 Button("Delete…", role: .destructive) { confirmDelete = true }
             }

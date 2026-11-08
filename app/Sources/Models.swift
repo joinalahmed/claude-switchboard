@@ -2,7 +2,7 @@ import SwiftUI
 
 enum SidebarItem: Hashable {
     case provider(String)
-    case terminal
+    case switcher
     case usage
     case health
 }
@@ -110,7 +110,8 @@ struct Provider: Identifiable, Hashable {
     var secrets: [SecretRef]
     var values: [String: String]
     var raw: String
-    var isDefault: Bool
+    var kindHint: String?
+    var isActive: Bool
     var id: String { name }
 
     var status: ProviderStatus {
@@ -191,18 +192,19 @@ enum TerminalApp: String, CaseIterable, Identifiable {
 enum Catalog {
     static let reserved: Set<String> = [
         "help", "list", "ls", "templates", "template", "template-vars", "secrets", "add", "new",
-        "edit", "remove", "rm", "key", "show", "test", "doctor", "default"
+        "edit", "remove", "rm", "key", "show", "test", "doctor", "default", "use", "status", "import", "auth",
+        "run", "shell", "overrides", "usage", "none", "off"
     ]
 
     static func read(_ path: String) -> String? {
         return try? String(contentsOfFile: path, encoding: .utf8)
     }
 
-    static func defaultName(dir: String) -> String {
-        guard let text = read(dir + "/default") else { return "vertex" }
+    /// The provider `ccp use` chose. Empty when none is active.
+    static func activeName(dir: String) -> String {
+        guard let text = read(dir + "/default") else { return "" }
         let first = text.split(separator: "\n").first.map(String.init) ?? ""
-        let trimmed = first.trimmingCharacters(in: .whitespaces)
-        return trimmed.isEmpty ? "vertex" : trimmed
+        return first.trimmingCharacters(in: .whitespaces)
     }
 
     static func headers(_ text: String, _ key: String) -> [String] {
@@ -261,7 +263,7 @@ enum Catalog {
         return result
     }
 
-    static func loadProviders(dir: String, defaultName: String) -> [Provider] {
+    static func loadProviders(dir: String, activeName: String) -> [Provider] {
         let all = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
         let files = all.filter { $0.hasSuffix(".env") }.sorted()
         var out: [Provider] = []
@@ -287,7 +289,8 @@ enum Catalog {
                 secrets: secrets,
                 values: parseValues(text),
                 raw: text,
-                isDefault: name == defaultName
+                kindHint: header(text, "kind"),
+                isActive: !activeName.isEmpty && name == activeName
             ))
         }
         return out
@@ -345,5 +348,46 @@ enum Catalog {
             i = s.index(after: i)
         }
         return out
+    }
+}
+
+/// What `ccp status` reports: which provider is active and whether Claude Code's settings file still matches it.
+struct SwitchStatus: Equatable {
+    enum State: String {
+        case synced, drift, stale, foreign, unset
+    }
+
+    var active: String
+    var state: State
+    var settingsPath: String
+    var keys: [String]
+    var helperOn: Bool
+    var hookInstalled: Bool
+    var claudePath: String
+
+    var settingsName: String { (settingsPath as NSString).abbreviatingWithTildeInPath }
+
+    /// True when every new `claude` session follows the active provider.
+    var inEffect: Bool { state == .synced && !active.isEmpty }
+
+    static func parse(_ text: String) -> SwitchStatus {
+        var s = SwitchStatus(active: "", state: .unset, settingsPath: "~/.claude/settings.json",
+                             keys: [], helperOn: false, hookInstalled: false, claudePath: "")
+        for part in text.split(separator: "\n") {
+            let f = part.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+            guard f.count == 2 else { continue }
+            let v = String(f[1])
+            switch f[0] {
+            case "active": s.active = v
+            case "state": s.state = State(rawValue: v) ?? .unset
+            case "settings": s.settingsPath = v
+            case "key": s.keys.append(v)
+            case "helper": s.helperOn = v == "on"
+            case "hook": s.hookInstalled = v == "installed"
+            case "claude": s.claudePath = v
+            default: break
+            }
+        }
+        return s
     }
 }

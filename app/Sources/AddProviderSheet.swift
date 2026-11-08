@@ -9,7 +9,7 @@ struct AddProviderSheet: View {
     @State private var name = ""
     @State private var values: [String: String] = [:]
     @State private var secrets: [String: String] = [:]
-    @State private var makeDefault = false
+    @State private var activate = false
     @State private var busy = false
     @State private var error: String? = nil
 
@@ -124,10 +124,10 @@ struct AddProviderSheet: View {
         let n = name
         let vals = values
         let secs = secrets
-        let def = makeDefault
+        let act = activate
         Task {
             let err = await store.saveProvider(name: n, template: t.name, values: vals,
-                                               secrets: secs, makeDefault: def, replace: false)
+                                               secrets: secs, activate: act, replace: false)
             busy = false
             if let err = err {
                 error = err
@@ -191,7 +191,7 @@ struct AddProviderSheet: View {
                     }
                 }
                 Section {
-                    Toggle("Make this the default provider", isOn: $makeDefault)
+                    Toggle("Switch claude to it right away", isOn: $activate)
                 }
             }
             .formStyle(.grouped)

@@ -39,6 +39,7 @@ if [ "$WITH_APP" = 1 ]; then
   install -m 755 "$HERE/app/Switchboard" "$APP/Contents/MacOS/Switchboard"
   "$HERE/app/make-icon.sh" "$APP/Contents/Resources/AppIcon.icns" >/dev/null 2>&1 \
     || echo "note       couldn't draw the app icon; the app will use the default one"
+  rm -f "$APP/Contents/Resources/src/"*.swift   # drop sources that no longer exist, or the app will not build
   install -m 644 "$HERE"/app/Sources/*.swift "$APP/Contents/Resources/src/"
   mkdir -p "$APP/Contents/Resources/bin" "$APP/Contents/Resources/templates"
   install -m 755 "$HERE/bin/ccp" "$APP/Contents/Resources/bin/ccp"

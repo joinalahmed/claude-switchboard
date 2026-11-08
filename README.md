@@ -2,9 +2,10 @@
 
 A Claude Code provider switcher for macOS. Choose which cloud Claude Code talks to: Anthropic (API key or subscription login), Google Vertex AI, Amazon Bedrock, Azure AI Foundry, or your own gateway such as LiteLLM. Switchboard is a native Mac app (SwiftUI) plus a small command-line tool, `ccp`, that does the work.
 
-- Keep several providers side by side and launch Claude Code with any of them.
-- Make one the default for plain `claude` in your terminal.
+- Keep several providers side by side and switch Claude Code between them with one click.
+- The switch applies everywhere Claude Code starts: Terminal, iTerm, VS Code and other editors.
 - Keep API keys and tokens in the macOS Keychain, not in files.
+- Launch one session with a different provider without switching.
 - See how much each provider has been used.
 
 <p align="center">
@@ -56,24 +57,26 @@ macOS 14 or later, and [Claude Code](https://docs.claude.com/en/docs/claude-code
 
 | | |
 |---|---|
-| **Providers** | One page per provider: pick a project folder, launch Claude Code in Terminal or iTerm, test the connection, edit settings, see exactly which variables Claude Code will get. |
+| **Switch** | Click the provider every new `claude` session should use. Shows what Claude Code is set to right now, spots settings that were changed by hand, and can keep those as a provider of their own. |
+| **Providers** | One page per provider: switch to it, launch one session with it in Terminal or iTerm, test the connection, edit settings, see exactly which variables Claude Code will get. |
 | **Add provider** | Choose a type (Anthropic API, Anthropic login, Vertex AI, Bedrock, Foundry, gateway, LiteLLM, custom) and fill in a short form. Keys go to the Keychain. |
-| **Terminal** | Pick the provider plain `claude` uses, and turn on the shell hook that makes it so. Finds provider variables hiding in Claude Code's own settings and removes them on request. |
 | **Usage** | Requests, sessions and tokens per provider, per day and per model. |
 | **Health check** | Looks for anything that would stop Claude Code from using the provider you chose. |
 
 ## The command line
 
 ```sh
-ccp                       # Claude Code with the default provider
-ccp vertex -c             # a named provider, extra arguments go to claude
+ccp use bedrock           # switch: every new claude session uses bedrock
+ccp status                # what claude is set to, and whether the settings still match
+ccp                       # Claude Code with the active provider
+ccp vertex -c             # one session with another provider, extra arguments go to claude
 ccp add                   # create a provider (asks for each value)
-ccp list                  # providers, * marks the default
-ccp default bedrock       # change the default
+ccp import corp           # keep the settings now in ~/.claude/settings.json as a provider
+ccp list                  # providers, * marks the active one
 ccp test vertex           # one real request through a provider
 ccp doctor                # things that could override your choice
-ccp shell install         # plain `claude` follows the default provider
-ccp overrides [--fix]     # find, or remove, provider variables in ~/.claude/settings*.json
+ccp shell install         # optional: count plain `claude` launches in Usage
+ccp overrides [--fix]     # find, or remove, provider variables in settings.json that ccp did not write
 ```
 
 `ccp help` shows everything.
@@ -100,13 +103,17 @@ export ANTHROPIC_AUTH_TOKEN={{ANTHROPIC_AUTH_TOKEN}}
 
 `# var:` lines are plain questions (`name | prompt | default | required`), `# secret:` lines are answers that go to the Keychain, and `{{NAME}}` marks where an answer is placed. A leading `?` drops a line when its answer is blank. See `templates/` for the built-in ones.
 
-## Plain `claude` and settings that override it
+## How switching works
 
-`ccp shell install` (or the switch on the app's Terminal page) adds a clearly marked `claude` function to your `~/.zshrc` that runs `ccp run`. Your original file is saved once as `.zshrc.ccp-backup`, and `ccp shell remove` takes the block out again.
+Claude Code reads the `env` block of `~/.claude/settings.json` at the start of every session and applies it over your shell's environment, wherever the session starts. `ccp use NAME` (or a click in the app) writes the provider's variables into that block, so the switch reaches Terminal windows, iTerm, VS Code and other editors alike. Sessions already running keep their provider until restarted.
 
-Claude Code applies the `env` block of `~/.claude/settings.json` over your shell, so provider variables there beat any provider you pick. `ccp overrides` lists them, and `ccp overrides --fix` removes them after saving a backup next to the file. The file is rewritten as plain JSON, so key order and formatting may change.
+Keys and tokens are not written to the file. Claude Code's `apiKeyHelper` setting is pointed at `ccp auth`, which reads the active provider's key from the Keychain when Claude Code asks for it. The two exceptions are Bedrock API keys and Foundry API keys, which Claude Code can only take from a variable; `ccp use` says so when it writes one.
 
-Editors and apps that start Claude Code without your shell, such as IDE extensions, are not affected by any of this.
+`ccp NAME` runs one session with another provider without switching: the session gets the provider's variables and a one-session settings override, so the active provider's entries don't apply to it.
+
+Before the first switch, `ccp status` tells you if `~/.claude/settings.json` already holds provider variables typed by hand. `ccp import NAME` keeps them as a provider (secrets move to the Keychain), after which you can switch between it and the others. The file is written as plain JSON, so key order and formatting may change; the previous version is kept next to it as `settings.json.ccp-backup`, and the very first version as `settings.json.ccp-original`.
+
+The optional shell hook (`ccp shell install`, or the Usage switch on the Switch page) makes plain `claude` run through `ccp run`, so launches are recorded for the Usage page. Switching never needs it.
 
 ## Usage tracking
 
