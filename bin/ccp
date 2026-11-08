@@ -493,25 +493,90 @@ need_name() {
 
 cmd_show() { local n; n="$(need_name "${1:-}")" || exit 1; load_provider "$n"; echo "ccp: $SUMMARY"; show_env; }
 
+# One direct request to the provider's endpoint, so a 401/404/429 shows in seconds instead of after
+# Claude Code's eleven retries. Only for providers whose endpoint and model we know; otherwise skipped.
+preflight() {
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v perl >/dev/null 2>&1 || return 0
+  local url body hf code msg gc tok model loc host
+  umask 077
+  hf="$(mktemp "${TMPDIR:-/tmp}/ccp-hdr.XXXXXX")" || return 0
+  if [ "${CLAUDE_CODE_USE_VERTEX:-}" = 1 ]; then
+    model="${ANTHROPIC_MODEL:-}"
+    [ -n "$model" ] || { rm -f "$hf"; return 0; }   # without a pinned model we can't know what Claude Code will ask for
+    gc="$(command -v gcloud 2>/dev/null || true)"
+    [ -n "$gc" ] || { [ -x "$HOME/google-cloud-sdk/bin/gcloud" ] && gc="$HOME/google-cloud-sdk/bin/gcloud"; }
+    [ -n "$gc" ] || { rm -f "$hf"; return 0; }
+    tok="$("$gc" auth application-default print-access-token 2>/dev/null)" || tok=""
+    if [ -z "$tok" ]; then rm -f "$hf"; echo "FAIL  $provider: no Google credentials — run: gcloud auth application-default login"; return 1; fi
+    loc="${CLOUD_ML_REGION:-us-east5}"
+    case "$loc" in
+      global) host="https://aiplatform.googleapis.com" ;;
+      eu|us)  host="https://aiplatform.$loc.rep.googleapis.com" ;;
+      *)      host="https://$loc-aiplatform.googleapis.com" ;;
+    esac
+    [ -n "${ANTHROPIC_VERTEX_BASE_URL:-}" ] && host="${ANTHROPIC_VERTEX_BASE_URL%/}"
+    url="$host/v1/projects/${ANTHROPIC_VERTEX_PROJECT_ID:-}/locations/$loc/publishers/anthropic/models/$model:rawPredict"
+    body='{"anthropic_version":"vertex-2023-10-16","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}'
+    printf 'Authorization: Bearer %s\n' "$tok" > "$hf"
+  elif [ -n "${ANTHROPIC_BASE_URL:-}" ] && [ -z "${CLAUDE_CODE_USE_BEDROCK:-}${CLAUDE_CODE_USE_FOUNDRY:-}" ]; then
+    url="${ANTHROPIC_BASE_URL%/}/v1/messages"
+    body="{\"model\":\"${ANTHROPIC_MODEL:-claude-sonnet-4-5}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+    {
+      echo 'anthropic-version: 2023-06-01'
+      [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] && printf 'Authorization: Bearer %s\n' "$ANTHROPIC_AUTH_TOKEN"
+      [ -n "${ANTHROPIC_API_KEY:-}" ] && printf 'x-api-key: %s\n' "$ANTHROPIC_API_KEY"
+    } > "$hf"
+  else
+    rm -f "$hf"; return 0
+  fi
+  code="$(curl -s -o "$hf.out" -w '%{http_code}' --max-time 30 -X POST "$url" -H @"$hf" -H 'Content-Type: application/json' -d "$body" 2>/dev/null)" || code="000"
+  msg="$(perl -MJSON::PP -e '
+    local $/; my $t = <STDIN>; my $d = eval { JSON::PP->new->utf8->decode($t) };
+    if (ref $d eq "HASH") {
+      my $e = $d->{error}; $e = $e->[0]{error} if ref $e eq "ARRAY" && ref $e->[0] eq "HASH";
+      if (ref $e eq "HASH") { print $e->{message} // $e->{type} // "" } elsif ($d->{type} && $d->{type} eq "error") { print $d->{error}{message} // "" }
+    } else { $t =~ s/<[^>]*>//g; $t =~ s/\s+/ /g; print substr($t, 0, 200) }' < "$hf.out" 2>/dev/null)"
+  rm -f "$hf" "$hf.out"
+  case "$code" in
+    2*) return 0 ;;
+    000) echo "FAIL  $provider: no answer from $url"; return 1 ;;
+  esac
+  echo "FAIL  $provider: HTTP $code from $url"
+  [ -n "$msg" ] && echo "      $msg"
+  case "$code" in
+    429) echo "      The quota for this model is used up or still zero. In the Google Cloud console open IAM & Admin > Quotas, filter on \"anthropic-claude\", and request an increase; also check the model is Enabled in Model Garden." ;;
+    404) echo "      The model isn't available at this location, or isn't enabled in Model Garden. Try CLOUD_ML_REGION=global, or another model ID." ;;
+    401|403) echo "      The credentials were rejected. Check the key/token, or for Vertex: gcloud auth application-default login and role roles/aiplatform.user." ;;
+  esac
+  return 1
+}
+
 cmd_test() {
   local n out rc ovr
   n="$(need_name "${1:-}")" || exit 1
   load_provider "$n"
   command -v claude >/dev/null 2>&1 || die "'claude' not found on PATH"
   note "testing $SUMMARY ..."
+  preflight || return 1
   export CCP_PROVIDER="$n"
   ovr="$(launch_overrides)"
   run_start "$n"
   if command -v perl >/dev/null 2>&1; then
-    out="$(perl -e 'alarm 120; exec @ARGV' claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
+    out="$(perl -e 'alarm 120; exec @ARGV' claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' --max-turns 1 2>&1)"; rc=$?
   else
-    out="$(claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' 2>&1)"; rc=$?
+    out="$(claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' --max-turns 1 2>&1)"; rc=$?
   fi
   run_end "$rc"
   [ -n "$ovr" ] && rm -f "$ovr"
   if [ "$rc" = 0 ] && [ -n "$out" ]; then
     echo "OK  $n works. Reply: $(printf '%s' "$out" | head -n1)"
     return 0
+  fi
+  if [ "$rc" = 142 ]; then
+    echo "FAIL  $n: no answer after 120 s. Claude Code kept retrying, which usually means the API answers with an error such as 429 (quota) or 404 (model)."
+    echo "      See the details with:  ccp $n -p hi --debug   then look in ~/.claude/debug/"
+    return 1
   fi
   echo "FAIL  $n (exit $rc):"
   printf '%s\n' "$out" | tail -n 15
