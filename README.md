@@ -109,6 +109,8 @@ Claude Code reads the `env` block of `~/.claude/settings.json` at the start of e
 
 Keys and tokens are not written to the file. Claude Code's `apiKeyHelper` setting is pointed at `ccp auth`, which reads the active provider's key from the Keychain when Claude Code asks for it. The two exceptions are Bedrock API keys and Foundry API keys, which Claude Code can only take from a variable; `ccp use` says so when it writes one.
 
+A gateway or LiteLLM provider can also carry two settings for a model behind the proxy that isn't Claude: the model's context window (`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, since Claude Code assumes 200k tokens for a name it doesn't know) and `DISABLE_PROMPT_CACHING=1` for models that reject prompt caching, such as Gemini on Vertex AI. Both are asked for when you add the provider and switch with it.
+
 `ccp NAME` runs one session with another provider without switching: the session gets the provider's variables and a one-session settings override, so the active provider's entries don't apply to it.
 
 Before the first switch, `ccp status` tells you if `~/.claude/settings.json` already holds provider variables typed by hand. `ccp import NAME` keeps them as a provider (secrets move to the Keychain), after which you can switch between it and the others. The file is written as plain JSON, so key order and formatting may change; the previous version is kept next to it as `settings.json.ccp-backup`, and the very first version as `settings.json.ccp-original`.

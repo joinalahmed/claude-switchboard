@@ -75,7 +75,24 @@ esc() {
   printf '%s' "$s"
 }
 
-is_secret_name() { case "$1" in *KEY*|*TOKEN*|*SECRET*|*PASSWORD*) return 0 ;; *) return 1 ;; esac; }
+# A name that ends in _TOKENS (or has _TOKENS_ in it) is a count such as CLAUDE_CODE_MAX_CONTEXT_TOKENS, not a secret.
+is_secret_name() { case "$1" in *_TOKENS|*_TOKENS_*) return 1 ;; *KEY*|*TOKEN*|*SECRET*|*PASSWORD*) return 0 ;; *) return 1 ;; esac; }
+# Mask the values of secret-looking keys in a JSON document on stdin.
+mask_json() {
+  perl -pe 's/"([A-Za-z0-9_]+)"(\s*:\s*")([^"]*)/ my ($k,$sep,$v)=($1,$2,$3); ($k =~ m{KEY|TOKEN|SECRET|PASSWORD} && $k !~ m{_TOKENS(_|$)}) ? "\"$k\"$sep***" : "\"$k\"$sep$v" /ge'
+}
+# True when an env file exports a secret-looking variable with a literal value (not ccp_secret, not a placeholder, not empty).
+plaintext_secret_in() {
+  local line v
+  while IFS= read -r line; do
+    v="${line#*export}"; v="${v%%=*}"; v="${v//[[:space:]]/}"
+    is_secret_name "$v" || continue
+    case "$line" in *ccp_secret*|*CHANGE_ME*) continue ;; esac
+    printf '%s' "$line" | grep -qE "=(''|\"\")?[[:space:]]*(#.*)?$" && continue
+    return 0
+  done < <(grep -E '^[[:space:]]*export[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=' "$1" 2>/dev/null)
+  return 1
+}
 
 # ---- Keychain ---------------------------------------------------------------
 have_security() { command -v security >/dev/null 2>&1; }
@@ -410,7 +427,8 @@ managed_vars() {
       ANTHROPIC_FOUNDRY_BASE_URL ANTHROPIC_FOUNDRY_API_KEY ANTHROPIC_FOUNDRY_AUTH_TOKEN \
       CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_FOUNDRY \
       CLAUDE_CODE_SKIP_VERTEX_AUTH CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_MANTLE_AUTH \
-      CLAUDE_CODE_SKIP_FOUNDRY_AUTH CLOUD_ML_REGION AWS_BEARER_TOKEN_BEDROCK AWS_PROFILE AWS_REGION
+      CLAUDE_CODE_SKIP_FOUNDRY_AUTH CLOUD_ML_REGION AWS_BEARER_TOKEN_BEDROCK AWS_PROFILE AWS_REGION \
+      CLAUDE_CODE_MAX_CONTEXT_TOKENS DISABLE_PROMPT_CACHING
     env | sed -n 's/^\(VERTEX_REGION_CLAUDE_[A-Za-z0-9_]*\)=.*/\1/p'
     cat "$DIR"/*.env 2>/dev/null | sed -n 's/^[[:space:]]*export[[:space:]][[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'
   } | grep -Ev '^(PATH|HOME|USER|LOGNAME|SHELL|TERM|PWD|OLDPWD|TMPDIR|LANG|LC_[A-Z_]+|SHLVL|_|CLAUDE_PROVIDERS_DIR|CLAUDE_PROVIDER|CLAUDE_CONFIG_DIR|CCP_[A-Z_]+)$' | sort -u
@@ -480,8 +498,9 @@ provider_token() { printf '%s' "${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}"
 show_env() {
   local v
   for v in $(managed_vars); do
-    if [ -n "${!v+x}" ]; then printf '%s=%s\n' "$v" "${!v}"; fi
-  done | sed -E 's/^([A-Za-z0-9_]*(KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)=.*/\1=***/'
+    [ -n "${!v+x}" ] || continue
+    if is_secret_name "$v"; then printf '%s=***\n' "$v"; else printf '%s=%s\n' "$v" "${!v}"; fi
+  done
 }
 
 need_name() {
@@ -531,6 +550,10 @@ preflight() {
     rm -f "$hf"; return 0
   fi
   code="$(curl -s -o "$hf.out" -w '%{http_code}' --max-time 30 -X POST "$url" -H @"$hf" -H 'Content-Type: application/json' -d "$body" 2>/dev/null)" || code="000"
+  if [ "$code" = 000 ]; then   # nothing answered; try once more before giving up
+    sleep 1
+    code="$(curl -s -o "$hf.out" -w '%{http_code}' --max-time 30 -X POST "$url" -H @"$hf" -H 'Content-Type: application/json' -d "$body" 2>/dev/null)" || code="000"
+  fi
   msg="$(perl -MJSON::PP -e '
     local $/; my $t = <STDIN>; my $d = eval { JSON::PP->new->utf8->decode($t) };
     if (ref $d eq "HASH") {
@@ -553,7 +576,7 @@ preflight() {
 }
 
 cmd_test() {
-  local n out rc ovr
+  local n out rc ovr reply
   n="$(need_name "${1:-}")" || exit 1
   load_provider "$n"
   command -v claude >/dev/null 2>&1 || die "'claude' not found on PATH"
@@ -563,14 +586,15 @@ cmd_test() {
   ovr="$(launch_overrides)"
   run_start "$n"
   if command -v perl >/dev/null 2>&1; then
-    out="$(perl -e 'alarm 120; exec @ARGV' claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' --max-turns 1 2>&1)"; rc=$?
+    out="$(perl -e 'alarm 120; exec @ARGV' claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' --max-turns 1 2>&1 </dev/null)"; rc=$?
   else
-    out="$(claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' --max-turns 1 2>&1)"; rc=$?
+    out="$(claude ${ovr:+--settings "$ovr"} -p 'Reply with exactly one word: ok' --max-turns 1 2>&1 </dev/null)"; rc=$?
   fi
   run_end "$rc"
   [ -n "$ovr" ] && rm -f "$ovr"
   if [ "$rc" = 0 ] && [ -n "$out" ]; then
-    echo "OK  $n works. Reply: $(printf '%s' "$out" | head -n1)"
+    reply="$(printf '%s\n' "$out" | grep -v '^\[claude-code:' | grep -v '^[[:space:]]*$' | head -n1)"
+    echo "OK  $n works. Reply: ${reply:-$(printf '%s' "$out" | head -n1)}"
     return 0
   fi
   if [ "$rc" = 142 ]; then
@@ -719,7 +743,7 @@ cmd_use() {
   echo "$n" > "$DIR/default"
   echo "ccp: claude now uses $SUMMARY"
   case "$out" in *backup*) echo "ccp: updated $SETTINGS (previous copy: $SETTINGS.ccp-backup)" ;; esac
-  echo "ccp: this applies to every new Claude Code session: Terminal, iTerm, VS Code, and other editors. Sessions already running keep their old provider."
+  echo "ccp: this applies to every new Claude Code session: Terminal, iTerm, VS Code, and other editors. Sessions already running keep their old endpoint and key, though Claude Code picks up model names from the file live, so restart them too."
 }
 
 # ---- the apiKeyHelper Claude Code calls ----------------------------------------------
@@ -1034,7 +1058,7 @@ cmd_doctor() {
     if needs_setup "$f"; then d_warn "$p still has CHANGE_ME placeholders (ccp edit $p)"; fi
     perm="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)"
     case "$perm" in *00) ;; *) d_warn "$p.env is readable by others (mode $perm) — chmod 600 $f" ;; esac
-    if grep -E '^[[:space:]]*export[[:space:]]+[A-Za-z0-9_]*(KEY|TOKEN|SECRET)[A-Za-z0-9_]*=' "$f" | grep -v ccp_secret | grep -v CHANGE_ME | grep -vqE "=(''|\"\")?[[:space:]]*(#.*)?$"; then
+    if plaintext_secret_in "$f"; then
       d_warn "$p.env holds a plaintext secret — move it to the Keychain: ccp add $p --force"
     fi
     while IFS= read -r svc; do
@@ -1119,7 +1143,7 @@ cleanup() { [ -n "$OVR" ] && rm -f "$OVR"; }
 
 if [ -n "${CCP_DRY_RUN:-}" ]; then
   echo "ccp: $SUMMARY"; show_env
-  if [ -n "$OVR" ]; then echo "ccp: settings overridden for this launch:"; sed -E 's/("[A-Za-z0-9_]*(KEY|TOKEN|SECRET)[A-Za-z0-9_]*" *: *")[^"]+/\1***/' "$OVR"; fi
+  if [ -n "$OVR" ]; then echo "ccp: settings overridden for this launch:"; mask_json < "$OVR"; fi
   cleanup; exit 0
 fi
 command -v claude >/dev/null 2>&1 || { cleanup; die "'claude' not found on PATH"; }

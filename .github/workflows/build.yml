@@ -31,7 +31,7 @@ jobs:
           ./install.sh --no-app
           export PATH="$HOME/bin:$PATH"
           export CLAUDE_CONFIG_DIR="$HOME/.claude"; mkdir -p "$CLAUDE_CONFIG_DIR"
-          echo '{"env":{"ANTHROPIC_BASE_URL":"https://gw.example.com","ANTHROPIC_MODEL":"demo-model"},"model":"opus"}' > "$CLAUDE_CONFIG_DIR/settings.json"
+          echo '{"env":{"ANTHROPIC_BASE_URL":"https://gw.example.com","ANTHROPIC_MODEL":"demo-model","CLAUDE_CODE_MAX_CONTEXT_TOKENS":"400000"},"model":"opus"}' > "$CLAUDE_CONFIG_DIR/settings.json"
           ccp templates --plain
           ccp status --plain | grep -q '^state	foreign'
           ccp import corp
@@ -41,8 +41,9 @@ jobs:
           ccp status --plain | grep -q '^state	synced'
           grep -q '"model" : "opus"' "$CLAUDE_CONFIG_DIR/settings.json"
           ! grep -q ANTHROPIC_BASE_URL "$CLAUDE_CONFIG_DIR/settings.json"
-          ccp use corp
+          ccp use corp 2>&1 | tee /dev/stderr | { ! grep -q 'plain text'; }   # a _TOKENS count is not a secret
           grep -q '"ANTHROPIC_MODEL" : "demo-model"' "$CLAUDE_CONFIG_DIR/settings.json"
+          ccp show corp | grep -q '^CLAUDE_CODE_MAX_CONTEXT_TOKENS=400000$'
           CCP_DRY_RUN=1 ccp demo | grep -q '"ANTHROPIC_BASE_URL" : ""'
           ccp use none
           ccp status --plain | grep -q '^state	unset'
